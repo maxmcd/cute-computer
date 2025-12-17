@@ -1,10 +1,9 @@
-import { Container, getContainer } from "@cloudflare/containers";
+import { Container } from "@cloudflare/containers";
 import { DurableObject } from "cloudflare:workers";
-import { Hono } from "hono";
 
 export class AppContainer extends Container<Env> {
-  // Port the container listens on (default: 8080)
-  defaultPort = 8080;
+  // Port the container listens on (default: 8283)
+  defaultPort = 8283;
   // Time before container sleeps due to inactivity (default: 30s)
   sleepAfter = "2m";
   // Environment variables passed to the container
@@ -709,9 +708,9 @@ export class S3 extends DurableObject<Env> {
 export default {
   fetch: (request: Request, env: Env) => {
     const url = new URL(request.url);
-    if (url.pathname === "/____container") {
-      return env.APP_CONTAINER.getByName("instance").fetch(request);
+    if (url.pathname.startsWith("/foo")) {
+      return env.S3.getByName("instance").fetch(request);
     }
-    return env.S3.getByName("instance").fetch(request);
+    return env.APP_CONTAINER.getByName("instance").fetch(request);
   },
 };

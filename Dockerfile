@@ -1,4 +1,18 @@
 # syntax=docker/dockerfile:1
+FROM golang:1.25-trixie AS builder
+
+RUN apt-get update \
+    && apt-get install -y unzip \
+    && curl -fsSL https://bun.com/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
+
+WORKDIR /opt
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY ./container_src ./container_src
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd ./container_src && bun i && go build -o /server .
 
 FROM debian:trixie
 RUN apt-get update && apt-get install -y curl unzip ca-certificates fuse \
@@ -12,13 +26,9 @@ RUN ARCH=$(uname -m) && \
     rm /tmp/tigrisfs.tar.gz && \
     chmod +x /usr/local/bin/tigrisfs
 
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:$PATH"
-
+COPY --from=builder /server /server
 WORKDIR /opt
-COPY /container_src/package.json /container_src/bun.lock /container_src/main.ts ./
-RUN bun i
 
-EXPOSE 8080
+EXPOSE 8283
 # Run
-CMD ["bun", "run", "/opt/main.ts"]
+CMD ["/server"]
