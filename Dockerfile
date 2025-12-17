@@ -1,24 +1,7 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.24-trixie AS build
-
-# Set destination for COPY
-WORKDIR /app
-
-# Download any Go modules
-COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg --mount=type=cache,target=/root/.cache/go-build \
-	go mod download
-
-# Copy container source code
-COPY container_src/*.go ./
-
-# Build
-RUN --mount=type=cache,target=/go/pkg --mount=type=cache,target=/root/.cache/go-build \
-	go build -o /server
-
 FROM debian:trixie
-RUN apt-get update && apt-get install -y curl fuse \
+RUN apt-get update && apt-get install -y curl unzip ca-certificates fuse \
 	&& rm -rf /var/lib/apt/lists/*
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
@@ -29,11 +12,13 @@ RUN ARCH=$(uname -m) && \
     rm /tmp/tigrisfs.tar.gz && \
     chmod +x /usr/local/bin/tigrisfs
 
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /server /server
+WORKDIR /opt
+COPY /container_src/package.json /container_src/bun.lock /container_src/main.ts ./
+RUN bun i
 
 EXPOSE 8080
-COPY container_src/startup.sh /startup.sh
 # Run
-CMD ["/startup.sh"]
+CMD ["bun", "run", "/opt/main.ts"]
