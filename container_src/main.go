@@ -1,30 +1,27 @@
 package main
 
 import (
-	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 )
-
-//go:embed index.html
-var indexHTML []byte
-
-//go:embed node_modules/ghostty-web/dist
-var distFS embed.FS
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -35,9 +32,10 @@ var upgrader = websocket.Upgrader{
 }
 
 type ptySession struct {
-	cmd    *exec.Cmd
-	ptmx   *os.File
-	ws     *websocket.Conn
+	cmd  *exec.Cmd
+	ptmx *os.File
+	ws   *websocket.Conn
+	// Do we really need this?
 	mu     sync.Mutex
 	closed bool
 }
@@ -46,6 +44,156 @@ type resizeMessage struct {
 	Type string `json:"type"`
 	Cols uint16 `json:"cols"`
 	Rows uint16 `json:"rows"`
+}
+
+// Config represents the user's configuration file
+type Config struct {
+	Static string `json:"static"`
+}
+
+// ConfigCache holds the parsed config with its modification time
+type ConfigCache struct {
+	config  *Config
+	modTime time.Time
+	mu      sync.RWMutex
+}
+
+var configCache = &ConfigCache{}
+
+// stripJSONComments removes comments from JSONC content
+func stripJSONComments(data []byte) []byte {
+	s := string(data)
+
+	// Remove single-line comments (// ...)
+	singleLineComment := regexp.MustCompile(`//[^\n]*`)
+	s = singleLineComment.ReplaceAllString(s, "")
+
+	// Remove multi-line comments (/* ... */)
+	multiLineComment := regexp.MustCompile(`/\*[\s\S]*?\*/`)
+	s = multiLineComment.ReplaceAllString(s, "")
+
+	// Remove trailing commas before closing braces/brackets
+	trailingComma := regexp.MustCompile(`,(\s*[}\]])`)
+	s = trailingComma.ReplaceAllString(s, "$1")
+
+	return []byte(s)
+}
+
+// ensureConfigExists creates a default config file if none exists
+func ensureConfigExists() error {
+	// Check for both .json and .jsonc
+	configPath := ""
+	if _, err := os.Stat("/home/cutie/config.json"); err == nil {
+		return nil // config.json exists
+	}
+	if _, err := os.Stat("/home/cutie/config.jsonc"); err == nil {
+		return nil // config.jsonc exists
+	}
+
+	// Neither exists, create default config.json
+	configPath = "/home/cutie/config.json"
+	defaultConfig := `{
+  "static": "."
+}`
+
+	if err := os.WriteFile(configPath, []byte(defaultConfig), 0644); err != nil {
+		return fmt.Errorf("failed to create default config: %w", err)
+	}
+
+	// Set ownership to cutie
+	if err := os.Chown(configPath, 1000, 1000); err != nil {
+		return fmt.Errorf("failed to set config ownership: %w", err)
+	}
+
+	log.Printf("Created default config at %s", configPath)
+	return nil
+}
+
+// loadConfig loads the config file with caching based on modification time
+func loadConfig() (*Config, error) {
+	// Find which config file exists
+	configPath := ""
+	if _, err := os.Stat("/home/cutie/config.json"); err == nil {
+		configPath = "/home/cutie/config.json"
+	} else if _, err := os.Stat("/home/cutie/config.jsonc"); err == nil {
+		configPath = "/home/cutie/config.jsonc"
+	} else {
+		return nil, fmt.Errorf("no config file found (tried config.json and config.jsonc)")
+	}
+
+	// Stat the file to check modification time
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat config file: %w", err)
+	}
+
+	// Check cache
+	configCache.mu.RLock()
+	if configCache.config != nil && configCache.modTime.Equal(info.ModTime()) {
+		config := configCache.config
+		configCache.mu.RUnlock()
+		return config, nil
+	}
+	configCache.mu.RUnlock()
+
+	// Need to reload
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Strip comments for JSONC support
+	data = stripJSONComments(data)
+
+	// Parse JSON
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config JSON: %w", err)
+	}
+
+	// Validate
+	if config.Static == "" {
+		return nil, fmt.Errorf("config.static field is required")
+	}
+
+	// Update cache
+	configCache.mu.Lock()
+	configCache.config = &config
+	configCache.modTime = info.ModTime()
+	configCache.mu.Unlock()
+
+	log.Printf("Loaded config from %s: static=%s", configPath, config.Static)
+	return &config, nil
+}
+
+// resolveStaticPath resolves the static directory path securely
+func resolveStaticPath(staticPath string) (string, error) {
+	// Resolve relative to /home/cutie
+	var fullPath string
+	if filepath.IsAbs(staticPath) {
+		fullPath = staticPath
+	} else {
+		fullPath = filepath.Join("/home/cutie", staticPath)
+	}
+
+	// Clean the path to remove .. and .
+	fullPath = filepath.Clean(fullPath)
+
+	// Security: ensure path is within /home/cutie
+	if !strings.HasPrefix(fullPath, "/home/cutie/") && fullPath != "/home/cutie" {
+		return "", fmt.Errorf("static path must be within /home/cutie (got: %s)", fullPath)
+	}
+
+	// Check if directory exists
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("static directory not found: %s", fullPath)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("static path is not a directory: %s", fullPath)
+	}
+
+	return fullPath, nil
 }
 
 func getShell() string {
@@ -78,10 +226,243 @@ func (s *ptySession) close() {
 	}
 }
 
+// serveErrorPage serves a beautiful error page
+func serveErrorPage(w http.ResponseWriter, title, message, details string) {
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>%s - Cute Computer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #ffeef8 0%%, #e0d4f7 100%%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #d946ef;
+            font-size: 28px;
+            margin-bottom: 20px;
+        }
+        .message {
+            color: #6b7280;
+            font-size: 16px;
+            line-height: 1.6;
+            margin-bottom: 20px;
+        }
+        .details {
+            background: #fef3c7;
+            border-left: 4px solid #f59e0b;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 14px;
+            color: #92400e;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>%s</h1>
+        <div class="message">%s</div>
+        %s
+    </div>
+</body>
+</html>`, title, title, message, details)
+
+	w.Write([]byte(html))
+}
+
+// serve404 serves a 404 error page
+func serve404(w http.ResponseWriter, path string) {
+	w.WriteHeader(http.StatusNotFound)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>404 Not Found - Cute Computer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #ffeef8 0%%, #e0d4f7 100%%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+            text-align: center;
+        }
+        h1 {
+            color: #d946ef;
+            font-size: 72px;
+            margin-bottom: 20px;
+        }
+        h2 {
+            color: #6b7280;
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+        .path {
+            background: #f3f4f6;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            color: #374151;
+            margin: 20px 0;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>404</h1>
+        <h2>File Not Found</h2>
+        <div class="path">%s</div>
+        <p style="color: #6b7280; margin-top: 20px;">The file you're looking for doesn't exist.</p>
+    </div>
+</body>
+</html>`, path)
+
+	w.Write([]byte(html))
+}
+
+// handleHTTP serves static files based on config
+func handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Only serve GET and HEAD requests
+	if r.Method != "GET" && r.Method != "HEAD" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Load config
+	config, err := loadConfig()
+	if err != nil {
+		details := fmt.Sprintf(`<div class="details">%s</div>`, err.Error())
+		serveErrorPage(w, "Configuration Error",
+			"There was a problem loading your config file. Please check the syntax and try again.",
+			details)
+		return
+	}
+
+	// Resolve static directory
+	staticDir, err := resolveStaticPath(config.Static)
+	if err != nil {
+		details := fmt.Sprintf(`<div class="details">%s
+
+Configured path: %s</div>`, err.Error(), config.Static)
+		serveErrorPage(w, "Static Directory Error",
+			"The configured static directory could not be found or accessed.",
+			details)
+		return
+	}
+
+	// Clean the request path
+	requestPath := filepath.Clean(r.URL.Path)
+	if requestPath == "/" {
+		requestPath = "/index.html"
+	}
+
+	// Remove leading slash for filepath.Join
+	requestPath = strings.TrimPrefix(requestPath, "/")
+
+	// Build full file path
+	fullPath := filepath.Join(staticDir, requestPath)
+
+	// Security: ensure the resolved path is still within staticDir
+	if !strings.HasPrefix(fullPath, staticDir) {
+		serve404(w, r.URL.Path)
+		return
+	}
+
+	// Check if file exists
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			serve404(w, r.URL.Path)
+			return
+		}
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// If it's a directory, try to serve index.html
+	if info.IsDir() {
+		indexPath := filepath.Join(fullPath, "index.html")
+		if _, err := os.Stat(indexPath); err == nil {
+			fullPath = indexPath
+		} else {
+			serve404(w, r.URL.Path)
+			return
+		}
+	}
+
+	// Read file
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Detect MIME type
+	mimeType := mime.TypeByExtension(filepath.Ext(fullPath))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	// Set headers
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+
+	// Write content
+	w.Write(content)
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Parse cols and rows from query params
+	// Parse query params
 	cols := 80
 	rows := 24
+	computerName := r.URL.Query().Get("name")
+	if computerName == "" {
+		computerName = "default"
+	}
+
 	if colsStr := r.URL.Query().Get("cols"); colsStr != "" {
 		if c, err := strconv.Atoi(colsStr); err == nil {
 			cols = c
@@ -101,13 +482,35 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	// Create shell command
+	// Create shell command as cutie user
 	shell := getShell()
-	cmd := exec.Command(shell)
-	cmd.Env = append(os.Environ(),
+
+	// Set PS1 with computer name - use raw escape codes
+	ps1 := fmt.Sprintf("\\[\\e[1;35m\\]%s\\[\\e[0m\\]:\\[\\e[1;36m\\]\\w\\[\\e[0m\\]\\$ ", computerName)
+
+	// Use bash with --norc --noprofile to prevent PS1 override
+	cmd := exec.Command(shell, "--norc", "--noprofile")
+
+	// Set user to cutie (UID 1000 is typically the first non-root user created)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: 1000, // cutie user
+			Gid: 1000, // cutie group
+		},
+	}
+
+	// Start in cutie's home directory
+	cmd.Dir = "/home/cutie"
+
+	cmd.Env = []string{
+		"HOME=/home/cutie",
+		"USER=cutie",
 		"TERM=xterm-256color",
 		"COLORTERM=truecolor",
-	)
+		fmt.Sprintf("PS1=%s", ps1),
+		"ENV=", // Disable any ENV file loading
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
 
 	// Start PTY
 	ptmx, err := pty.Start(cmd)
@@ -131,14 +534,36 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to set PTY size: %v", err)
 	}
 
-	// Send welcome message
-	welcomeMsg := "\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m\r\n" +
-		"\x1b[1;36m║\x1b[0m  \x1b[1;32mWelcome to ghostty-web!\x1b[0m                                     \x1b[1;36m║\x1b[0m\r\n" +
-		"\x1b[1;36m║\x1b[0m                                                              \x1b[1;36m║\x1b[0m\r\n" +
-		"\x1b[1;36m║\x1b[0m  You have a real shell session with full PTY support.        \x1b[1;36m║\x1b[0m\r\n" +
-		"\x1b[1;36m║\x1b[0m  Try: \x1b[1;33mls\x1b[0m, \x1b[1;33mcd\x1b[0m, \x1b[1;33mtop\x1b[0m, \x1b[1;33mvim\x1b[0m, or any command!                      \x1b[1;36m║\x1b[0m\r\n" +
-		"\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m\r\n\r\n"
-	ws.WriteMessage(websocket.TextMessage, []byte(welcomeMsg))
+	// Send welcome message with gradient line
+	var welcomeMsg strings.Builder
+	welcomeMsg.WriteString("\r\n")
+	welcomeMsg.WriteString("           Welcome to Cute Computer!  >_<\r\n")
+	welcomeMsg.WriteString("           ")
+
+	// Gradient line: pink -> purple -> indigo
+	width := 33
+	for i := 0; i < width; i++ {
+		progress := float64(i) / float64(width-1)
+
+		if progress < 0.5 {
+			// Pink to purple
+			t := progress * 2
+			red := int(251.0 - t*18.0)  // 251 -> 233
+			green := int(207.0 + t*6.0) // 207 -> 213
+			blue := int(232.0 + t*23.0) // 232 -> 255
+			welcomeMsg.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm─\x1b[0m", red, green, blue))
+		} else {
+			// Purple to indigo
+			t := (progress - 0.5) * 2
+			red := int(233.0 - t*34.0)  // 233 -> 199
+			green := int(213.0 - t*3.0) // 213 -> 210
+			blue := int(255.0 - t*1.0)  // 255 -> 254
+			welcomeMsg.WriteString(fmt.Sprintf("\x1b[38;2;%d;%d;%dm─\x1b[0m", red, green, blue))
+		}
+	}
+
+	welcomeMsg.WriteString("\r\n\r\n")
+	ws.WriteMessage(websocket.TextMessage, []byte(welcomeMsg.String()))
 
 	// PTY -> WebSocket (read from PTY, send to browser)
 	go func() {
@@ -204,14 +629,25 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Ensure config file exists with defaults
+	if err := ensureConfigExists(); err != nil {
+		log.Printf("Warning: Failed to ensure config exists: %v", err)
+	}
+
 	loc := os.Getenv("CLOUDFLARE_LOCATION")
 
 	// Don't mount fuse in local docker
 	if loc != "" && loc != "loc01" {
-		if err := os.MkdirAll("/opt/s3", 0755); err != nil {
+		// Create s3 directory in cutie's home directory and set ownership
+		if err := os.MkdirAll("/home/cutie/s3", 0755); err != nil {
 			log.Fatalf("Failed to create directory: %v", err)
 		}
-		cmd := exec.Command("/usr/local/bin/tigrisfs", "--endpoint", "https://s3do.maxm.workers.dev/", "-f", "foo", "/opt/s3")
+		// Change ownership to cutie (UID 1000, GID 1000)
+		if err := os.Chown("/home/cutie/s3", 1000, 1000); err != nil {
+			log.Fatalf("Failed to change ownership: %v", err)
+		}
+
+		cmd := exec.Command("/usr/local/bin/tigrisfs", "--endpoint", "https://s3do.maxm.workers.dev/", "-f", "foo", "/home/cutie/s3")
 		cmd.Env = append(os.Environ(),
 			"AWS_ACCESS_KEY_ID=foo",
 			"AWS_SECRET_ACCESS_KEY=bar",
@@ -227,43 +663,8 @@ func main() {
 	// WebSocket endpoint for PTY
 	http.HandleFunc("/ws", handleWebSocket)
 
-	http.HandleFunc("/____container", func(w http.ResponseWriter, r *http.Request) {
-		if err := os.WriteFile("/opt/s3/test.txt", []byte("Hello World!"), 0644); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		entries, err := os.ReadDir("/opt/s3")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		names := make([]string, len(entries))
-		for i, entry := range entries {
-			names[i] = entry.Name()
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(names)
-	})
-
-	// Serve the ghostty-web dist folder from embedded files
-	distSubFS, err := fs.Sub(distFS, "node_modules/ghostty-web/dist")
-	if err != nil {
-		log.Fatalf("Failed to create sub filesystem: %v", err)
-	}
-	http.Handle("/dist/", http.StripPrefix("/dist/", http.FileServer(http.FS(distSubFS))))
-
-	// Serve index.html at root from embedded file
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(indexHTML)
-	})
+	// All other requests go to static file handler
+	http.HandleFunc("/", handleHTTP)
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)

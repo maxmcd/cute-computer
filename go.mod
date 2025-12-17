@@ -1,4 +1,4 @@
-module github.com/maxmcd/s3do
+module github.com/maxmcd/cute-computer
 
 go 1.25.2
 

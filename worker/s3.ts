@@ -1,29 +1,4 @@
-import { Container } from "@cloudflare/containers";
 import { DurableObject } from "cloudflare:workers";
-
-export class AppContainer extends Container<Env> {
-  // Port the container listens on (default: 8283)
-  defaultPort = 8283;
-  // Time before container sleeps due to inactivity (default: 30s)
-  sleepAfter = "2m";
-  // Environment variables passed to the container
-  envVars = {
-    MESSAGE: "I was passed in via the container class!",
-  };
-
-  // Optional lifecycle hooks
-  override onStart() {
-    console.log("Container successfully started");
-  }
-
-  override onStop() {
-    console.log("Container successfully shut down");
-  }
-
-  override onError(error: unknown) {
-    console.log("Container error:", error);
-  }
-}
 
 interface S3Object {
   bucket: string;
@@ -145,14 +120,14 @@ export class S3 extends DurableObject<Env> {
     return this.errorResponse(
       "NotImplemented",
       "Operation not implemented",
-      501
+      501,
     );
   }
 
   private async putObject(
     bucket: string,
     key: string,
-    request: Request
+    request: Request,
   ): Promise<Response> {
     try {
       const data = await request.arrayBuffer();
@@ -173,7 +148,7 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key
+        key,
       );
 
       // Store data in chunks
@@ -194,7 +169,7 @@ export class S3 extends DurableObject<Env> {
             etag,
             lastModified,
             contentType,
-            chunk.buffer
+            chunk.buffer,
           );
         } else {
           this.sql.exec(
@@ -206,7 +181,7 @@ export class S3 extends DurableObject<Env> {
             "",
             "",
             "",
-            chunk.buffer
+            chunk.buffer,
           );
         }
         chunkIndex++;
@@ -228,14 +203,14 @@ export class S3 extends DurableObject<Env> {
   private async getObject(
     bucket: string,
     key: string,
-    headOnly: boolean
+    headOnly: boolean,
   ): Promise<Response> {
     try {
       // Get metadata from chunk 0
       const result = this.sql.exec(
         `SELECT size, etag, last_modified, content_type FROM objects WHERE bucket = ? AND key = ? AND chunk_index = 0`,
         bucket,
-        key
+        key,
       );
 
       const rows = [...result];
@@ -243,7 +218,7 @@ export class S3 extends DurableObject<Env> {
         return this.errorResponse(
           "NoSuchKey",
           "The specified key does not exist.",
-          404
+          404,
         );
       }
 
@@ -264,7 +239,7 @@ export class S3 extends DurableObject<Env> {
       const chunksResult = this.sql.exec(
         `SELECT data FROM objects WHERE bucket = ? AND key = ? ORDER BY chunk_index`,
         bucket,
-        key
+        key,
       );
       const chunks = [...chunksResult] as any[];
 
@@ -289,7 +264,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to retrieve object",
-        500
+        500,
       );
     }
   }
@@ -299,7 +274,7 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key
+        key,
       );
 
       return new Response(null, {
@@ -313,7 +288,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to delete object",
-        500
+        500,
       );
     }
   }
@@ -331,7 +306,7 @@ export class S3 extends DurableObject<Env> {
 
   private async listObjectsV2(
     bucket: string,
-    params: URLSearchParams
+    params: URLSearchParams,
   ): Promise<Response> {
     try {
       const prefix = params.get("prefix") || "";
@@ -409,7 +384,7 @@ export class S3 extends DurableObject<Env> {
   private async createMultipartUpload(
     bucket: string,
     key: string,
-    request: Request
+    request: Request,
   ): Promise<Response> {
     try {
       const uploadId = crypto.randomUUID();
@@ -423,7 +398,7 @@ export class S3 extends DurableObject<Env> {
         bucket,
         key,
         createdAt,
-        contentType
+        contentType,
       );
 
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -445,7 +420,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to create multipart upload",
-        500
+        500,
       );
     }
   }
@@ -455,7 +430,7 @@ export class S3 extends DurableObject<Env> {
     key: string,
     uploadId: string,
     partNumber: number,
-    request: Request
+    request: Request,
   ): Promise<Response> {
     try {
       const data = await request.arrayBuffer();
@@ -472,7 +447,7 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ? AND part_number = ?`,
         uploadId,
-        partNumber
+        partNumber,
       );
 
       // Store data in chunks
@@ -491,7 +466,7 @@ export class S3 extends DurableObject<Env> {
             chunkIndex,
             size,
             etag,
-            chunk.buffer
+            chunk.buffer,
           );
         } else {
           this.sql.exec(
@@ -501,7 +476,7 @@ export class S3 extends DurableObject<Env> {
             chunkIndex,
             0,
             "",
-            chunk.buffer
+            chunk.buffer,
           );
         }
         chunkIndex++;
@@ -524,13 +499,13 @@ export class S3 extends DurableObject<Env> {
     bucket: string,
     key: string,
     uploadId: string,
-    request: Request
+    request: Request,
   ): Promise<Response> {
     try {
       // Get upload metadata
       const uploadResult = this.sql.exec(
         `SELECT content_type FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId
+        uploadId,
       );
       const uploads = [...uploadResult] as any[];
 
@@ -538,7 +513,7 @@ export class S3 extends DurableObject<Env> {
         return this.errorResponse(
           "NoSuchUpload",
           "The specified upload does not exist",
-          404
+          404,
         );
       }
 
@@ -547,7 +522,7 @@ export class S3 extends DurableObject<Env> {
       // Get all parts metadata (chunk 0 only), ordered by part number
       const partsResult = this.sql.exec(
         `SELECT part_number, size, etag FROM multipart_parts WHERE upload_id = ? AND chunk_index = 0 ORDER BY part_number`,
-        uploadId
+        uploadId,
       );
       const parts = [...partsResult] as any[];
 
@@ -565,7 +540,7 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key
+        key,
       );
 
       // Copy part chunks to object chunks, re-indexing them
@@ -577,7 +552,7 @@ export class S3 extends DurableObject<Env> {
         const partChunksResult = this.sql.exec(
           `SELECT data FROM multipart_parts WHERE upload_id = ? AND part_number = ? ORDER BY chunk_index`,
           uploadId,
-          part.part_number
+          part.part_number,
         );
         const partChunks = [...partChunksResult] as any[];
 
@@ -593,7 +568,7 @@ export class S3 extends DurableObject<Env> {
               etag,
               lastModified,
               contentType,
-              chunk.data
+              chunk.data,
             );
           } else {
             this.sql.exec(
@@ -605,7 +580,7 @@ export class S3 extends DurableObject<Env> {
               "",
               "",
               "",
-              chunk.data
+              chunk.data,
             );
           }
           objectChunkIndex++;
@@ -615,11 +590,11 @@ export class S3 extends DurableObject<Env> {
       // Clean up multipart upload data
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ?`,
-        uploadId
+        uploadId,
       );
       this.sql.exec(
         `DELETE FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId
+        uploadId,
       );
 
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -642,7 +617,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to complete multipart upload",
-        500
+        500,
       );
     }
   }
@@ -651,11 +626,11 @@ export class S3 extends DurableObject<Env> {
     try {
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ?`,
-        uploadId
+        uploadId,
       );
       this.sql.exec(
         `DELETE FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId
+        uploadId,
       );
 
       return new Response(null, {
@@ -669,7 +644,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to abort multipart upload",
-        500
+        500,
       );
     }
   }
@@ -677,7 +652,7 @@ export class S3 extends DurableObject<Env> {
   private errorResponse(
     code: string,
     message: string,
-    status: number
+    status: number,
   ): Response {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Error>
@@ -704,13 +679,3 @@ export class S3 extends DurableObject<Env> {
       .replace(/'/g, "&apos;");
   }
 }
-
-export default {
-  fetch: (request: Request, env: Env) => {
-    const url = new URL(request.url);
-    if (url.pathname.startsWith("/foo")) {
-      return env.S3.getByName("instance").fetch(request);
-    }
-    return env.APP_CONTAINER.getByName("instance").fetch(request);
-  },
-};

@@ -4,7 +4,6 @@ FROM golang:1.25-trixie AS builder
 RUN apt-get update \
     && apt-get install -y unzip \
     && curl -fsSL https://bun.com/install | bash
-ENV PATH="/root/.bun/bin:$PATH"
 
 WORKDIR /opt
 COPY go.mod go.sum ./
@@ -12,7 +11,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY ./container_src ./container_src
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    cd ./container_src && bun i && go build -o /server .
+    cd ./container_src && go build -o /server .
 
 FROM debian:trixie
 RUN apt-get update && apt-get install -y curl unzip ca-certificates fuse \
@@ -26,9 +25,12 @@ RUN ARCH=$(uname -m) && \
     rm /tmp/tigrisfs.tar.gz && \
     chmod +x /usr/local/bin/tigrisfs
 
+# Create cutie user with home directory 
+RUN useradd -m -s /bin/bash cutie
+
 COPY --from=builder /server /server
 WORKDIR /opt
 
 EXPOSE 8283
-# Run
+# Run server as root, but shell sessions will run as cutie
 CMD ["/server"]

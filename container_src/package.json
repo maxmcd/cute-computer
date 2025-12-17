@@ -1,7 +1,0 @@
-{
-  "name": "container_src",
-  "private": true,
-  "dependencies": {
-    "ghostty-web": "latest"
-  }
-}
