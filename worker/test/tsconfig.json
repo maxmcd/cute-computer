@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.cloudflare.json",
+  "compilerOptions": {
+    "types": [
+      "@cloudflare/vitest-pool-workers" // This provides cloudflare:test types
+    ]
+  },
+  "include": [
+    "./**/*.ts",
+    "../../worker-configuration.d.ts" // Include wrangler types output
+  ]
+}

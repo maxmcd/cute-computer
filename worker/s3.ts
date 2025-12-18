@@ -153,25 +153,27 @@ export class S3 extends DurableObject<Env> {
 
       // Store data in chunks
       const dataArray = new Uint8Array(data);
-      let chunkIndex = 0;
-      for (let offset = 0; offset < size; offset += CHUNK_SIZE) {
-        const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
-        const chunk = dataArray.slice(offset, chunkEnd);
+      
+      // Always insert chunk 0 with metadata (even if empty)
+      this.sql.exec(
+        `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        bucket,
+        key,
+        0,
+        size,
+        etag,
+        lastModified,
+        contentType,
+        size === 0 ? new ArrayBuffer(0) : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer,
+      );
 
-        // First chunk (index 0) has metadata, rest have empty strings
-        if (chunkIndex === 0) {
-          this.sql.exec(
-            `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            bucket,
-            key,
-            chunkIndex,
-            size,
-            etag,
-            lastModified,
-            contentType,
-            chunk.buffer,
-          );
-        } else {
+      // If file is larger than one chunk, store remaining chunks
+      if (size > CHUNK_SIZE) {
+        let chunkIndex = 1;
+        for (let offset = CHUNK_SIZE; offset < size; offset += CHUNK_SIZE) {
+          const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
+          const chunk = dataArray.slice(offset, chunkEnd);
+          
           this.sql.exec(
             `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             bucket,
@@ -183,8 +185,8 @@ export class S3 extends DurableObject<Env> {
             "",
             chunk.buffer,
           );
+          chunkIndex++;
         }
-        chunkIndex++;
       }
 
       return new Response(null, {
@@ -452,23 +454,25 @@ export class S3 extends DurableObject<Env> {
 
       // Store data in chunks
       const dataArray = new Uint8Array(data);
-      let chunkIndex = 0;
-      for (let offset = 0; offset < size; offset += CHUNK_SIZE) {
-        const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
-        const chunk = dataArray.slice(offset, chunkEnd);
+      
+      // Always insert chunk 0 with metadata (even if empty)
+      this.sql.exec(
+        `INSERT INTO multipart_parts (upload_id, part_number, chunk_index, size, etag, data) VALUES (?, ?, ?, ?, ?, ?)`,
+        uploadId,
+        partNumber,
+        0,
+        size,
+        etag,
+        size === 0 ? new ArrayBuffer(0) : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer,
+      );
 
-        // First chunk (index 0) has metadata, rest have empty strings
-        if (chunkIndex === 0) {
-          this.sql.exec(
-            `INSERT INTO multipart_parts (upload_id, part_number, chunk_index, size, etag, data) VALUES (?, ?, ?, ?, ?, ?)`,
-            uploadId,
-            partNumber,
-            chunkIndex,
-            size,
-            etag,
-            chunk.buffer,
-          );
-        } else {
+      // If part is larger than one chunk, store remaining chunks
+      if (size > CHUNK_SIZE) {
+        let chunkIndex = 1;
+        for (let offset = CHUNK_SIZE; offset < size; offset += CHUNK_SIZE) {
+          const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
+          const chunk = dataArray.slice(offset, chunkEnd);
+          
           this.sql.exec(
             `INSERT INTO multipart_parts (upload_id, part_number, chunk_index, size, etag, data) VALUES (?, ?, ?, ?, ?, ?)`,
             uploadId,
@@ -478,8 +482,8 @@ export class S3 extends DurableObject<Env> {
             "",
             chunk.buffer,
           );
+          chunkIndex++;
         }
-        chunkIndex++;
       }
 
       return new Response(null, {
