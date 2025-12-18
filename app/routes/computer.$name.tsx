@@ -32,6 +32,9 @@ export default function Computer({ params }: any) {
   const [reconnectMessage, setReconnectMessage] = useState("");
   const [subdomainUrl, setSubdomainUrl] = useState("");
 
+  // View state
+  const [currentView, setCurrentView] = useState<"landing" | "terminal" | "editor" | "logs" | "preview">("landing");
+
   // Editor state
   const [doId, setDoId] = useState<string>("");
   const [fileTree, setFileTree] = useState<TreeNode[]>([]);
