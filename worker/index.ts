@@ -108,6 +108,7 @@ export default {
     if (
       !url.host.includes("workers.dev") && // dont expect subdomain stuff on workers.dev
       url.host !== "cute.maxmcd.com" &&
+      url.hostname !== "host.lima.internal" &&
       subdomain &&
       subdomain !== "localhost"
     ) {

@@ -57,6 +57,7 @@ export class S3 extends DurableObject<Env> {
     const method = request.method;
 
     // Parse path-style URL: /bucket/key or /bucket?list-type=2
+    // We need to preserve trailing slashes for directory markers
     const pathParts = url.pathname.split("/").filter((p) => p.length > 0);
 
     if (pathParts.length === 0) {
@@ -64,7 +65,16 @@ export class S3 extends DurableObject<Env> {
     }
 
     const bucket = pathParts[0];
-    const key = pathParts.slice(1).join("/");
+    
+    // Extract key while preserving trailing slashes
+    // S3 treats "foo" and "foo/" as different keys (file vs directory marker)
+    const bucketPrefix = `/${bucket}`;
+    let key = "";
+    if (url.pathname.startsWith(bucketPrefix + "/")) {
+      key = url.pathname.slice(bucketPrefix.length + 1);
+    } else if (url.pathname === bucketPrefix) {
+      key = "";
+    }
 
     // HEAD bucket (check if bucket exists)
     if (method === "HEAD" && !key) {

@@ -342,4 +342,131 @@ describe("S3 with AWS SDK", () => {
     const retrieved = await getResult.Body?.transformToString();
     expect(retrieved).toBe(content);
   });
+
+  it("preserves trailing slashes in keys for directory markers", async () => {
+    const s3Client = createS3Client("trailing-slash-test");
+    const bucket = "test-bucket";
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "foo", Body: "file content" })
+    );
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "foo/", Body: "" })
+    );
+
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket })
+    );
+
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys).toHaveLength(2);
+    expect(keys.includes("foo")).toBe(true);
+    expect(keys.includes("foo/")).toBe(true);
+  });
+
+  it("can GET directory markers with trailing slash", async () => {
+    const s3Client = createS3Client("dir-marker-test");
+    const bucket = "test-bucket";
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "dir/", Body: "" })
+    );
+
+    const getResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: "dir/" })
+    );
+
+    expect(getResult.ContentLength).toBe(0);
+
+    const headResult = await s3Client.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: "dir/" })
+    );
+
+    expect(headResult.ContentLength).toBe(0);
+  });
+
+  it("can DELETE directory markers with trailing slash", async () => {
+    const s3Client = createS3Client("delete-dir-test");
+    const bucket = "test-bucket";
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "mydir/", Body: "" })
+    );
+
+    const deleteResult = await s3Client.send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: "mydir/" })
+    );
+    expect(deleteResult.$metadata.httpStatusCode).toBe(204);
+
+    await expect(
+      s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: "mydir/" }))
+    ).rejects.toThrow();
+  });
+
+  it("treats foo and foo/ as distinct keys", async () => {
+    const s3Client = createS3Client("distinct-keys-test");
+    const bucket = "test-bucket";
+    const fileContent = "this is a file";
+    const dirContent = "";
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "item", Body: fileContent })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "item/", Body: dirContent })
+    );
+
+    const fileResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: "item" })
+    );
+    const fileBody = await fileResult.Body?.transformToString();
+    expect(fileBody).toBe(fileContent);
+
+    const dirResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: "item/" })
+    );
+    const dirBody = await dirResult.Body?.transformToString();
+    expect(dirBody).toBe(dirContent);
+
+    await s3Client.send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: "item" })
+    );
+
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket })
+    );
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toBe("item/");
+  });
+
+  it("lists directory structure with nested paths and trailing slashes", async () => {
+    const s3Client = createS3Client("nested-dir-test");
+    const bucket = "test-bucket";
+
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "a/", Body: "" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "a/b/", Body: "" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "a/b/file.txt", Body: "data" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "a/file2.txt", Body: "data2" })
+    );
+
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket })
+    );
+
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys).toHaveLength(4);
+    expect(keys.includes("a/")).toBe(true);
+    expect(keys.includes("a/b/")).toBe(true);
+    expect(keys.includes("a/b/file.txt")).toBe(true);
+    expect(keys.includes("a/file2.txt")).toBe(true);
+  });
 });
