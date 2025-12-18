@@ -23,11 +23,16 @@ export class AppContainer extends Container<Env> {
   // Port the container listens on (default: 8283)
   defaultPort = 8283;
   // Time before container sleeps due to inactivity (default: 30s)
-  sleepAfter = "2m";
+  sleepAfter = "10m";
   // Environment variables passed to the container
   envVars = {
     MESSAGE: "I was passed in via the container class!",
   };
+
+  // override async onActivityExpired(): Promise<void> {
+  //   // Do nothing
+  //   return;
+  // }
 
   // Optional lifecycle hooks
   override onStart() {

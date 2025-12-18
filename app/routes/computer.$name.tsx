@@ -12,6 +12,7 @@ export default function Computer({ params }: any) {
   const terminalRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const fitAddonRef = useRef<any>(null);
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [status, setStatus] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");

@@ -22,6 +22,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
+)
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// Allow all origins for development
@@ -482,6 +487,13 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
+	// Set up pong handler
+	ws.SetReadDeadline(time.Now().Add(pongWait))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	// Create shell command as cutie user
 	shell := getShell()
 
@@ -564,6 +576,26 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	welcomeMsg.WriteString("\r\n\r\n")
 	ws.WriteMessage(websocket.TextMessage, []byte(welcomeMsg.String()))
+
+	// Start ping ticker to keep connection alive
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			session.mu.Lock()
+			if session.closed {
+				session.mu.Unlock()
+				return
+			}
+			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				log.Printf("Ping error: %v", err)
+				session.mu.Unlock()
+				return
+			}
+			session.mu.Unlock()
+		}
+	}()
 
 	// PTY -> WebSocket (read from PTY, send to browser)
 	go func() {
