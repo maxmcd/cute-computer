@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -60,23 +59,29 @@ type ConfigCache struct {
 
 var configCache = &ConfigCache{}
 
-// stripJSONComments removes comments from JSONC content
-func stripJSONComments(data []byte) []byte {
-	s := string(data)
+// waitForMount polls until the directory is a FUSE mount (not a regular directory)
+func waitForMount(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
-	// Remove single-line comments (// ...)
-	singleLineComment := regexp.MustCompile(`//[^\n]*`)
-	s = singleLineComment.ReplaceAllString(s, "")
+	const FUSE_SUPER_MAGIC = 0x65735546 // FUSE filesystem magic number
 
-	// Remove multi-line comments (/* ... */)
-	multiLineComment := regexp.MustCompile(`/\*[\s\S]*?\*/`)
-	s = multiLineComment.ReplaceAllString(s, "")
+	for range ticker.C {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(path, &stat); err == nil {
+			// Check if it's a FUSE filesystem
+			if stat.Type == FUSE_SUPER_MAGIC {
+				log.Printf("Mount at %s is ready (FUSE detected)", path)
+				return nil
+			}
+		}
 
-	// Remove trailing commas before closing braces/brackets
-	trailingComma := regexp.MustCompile(`,(\s*[}\]])`)
-	s = trailingComma.ReplaceAllString(s, "$1")
-
-	return []byte(s)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for FUSE mount at %s", path)
+		}
+	}
+	return fmt.Errorf("ticker closed unexpectedly")
 }
 
 // ensureConfigExists creates a default config file if none exists
@@ -98,11 +103,6 @@ func ensureConfigExists() error {
 
 	if err := os.WriteFile(configPath, []byte(defaultConfig), 0644); err != nil {
 		return fmt.Errorf("failed to create default config: %w", err)
-	}
-
-	// Set ownership to cutie
-	if err := os.Chown(configPath, 1000, 1000); err != nil {
-		return fmt.Errorf("failed to set config ownership: %w", err)
 	}
 
 	log.Printf("Created default config at %s", configPath)
@@ -143,7 +143,7 @@ func loadConfig() (*Config, error) {
 	}
 
 	// Strip comments for JSONC support
-	data = stripJSONComments(data)
+	data = sanitizeJSONC(data)
 
 	// Parse JSON
 	var config Config
@@ -492,12 +492,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command(shell, "--norc", "--noprofile")
 
 	// Set user to cutie (UID 1000 is typically the first non-root user created)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid: 1000, // cutie user
-			Gid: 1000, // cutie group
-		},
-	}
+	// cmd.SysProcAttr = &syscall.SysProcAttr{
+	// 	Credential: &syscall.Credential{
+	// 		Uid: 1000, // cutie user
+	// 		Gid: 1000, // cutie group
+	// 	},
+	// }
 
 	// Start in cutie's home directory
 	cmd.Dir = "/home/cutie"
@@ -629,35 +629,57 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Ensure config file exists with defaults
-	if err := ensureConfigExists(); err != nil {
-		log.Printf("Warning: Failed to ensure config exists: %v", err)
-	}
 
 	loc := os.Getenv("CLOUDFLARE_LOCATION")
 
 	// Don't mount fuse in local docker
 	if loc != "" && loc != "loc01" {
-		// Create s3 directory in cutie's home directory and set ownership
-		if err := os.MkdirAll("/home/cutie/s3", 0755); err != nil {
+		// Get Durable Object ID to use as S3 bucket name for isolation
+		doID := os.Getenv("CLOUDFLARE_DURABLE_OBJECT_ID")
+		if doID == "" {
+			log.Fatalf("CLOUDFLARE_DURABLE_OBJECT_ID not set")
+		}
+		log.Printf("Using Durable Object ID as S3 bucket: %s", doID)
+
+		// Create mount point directory
+		if err := os.MkdirAll("/home/cutie", 0755); err != nil {
 			log.Fatalf("Failed to create directory: %v", err)
 		}
-		// Change ownership to cutie (UID 1000, GID 1000)
-		if err := os.Chown("/home/cutie/s3", 1000, 1000); err != nil {
-			log.Fatalf("Failed to change ownership: %v", err)
-		}
 
-		cmd := exec.Command("/usr/local/bin/tigrisfs", "--endpoint", "https://s3do.maxm.workers.dev/", "-f", "foo", "/home/cutie/s3")
-		cmd.Env = append(os.Environ(),
-			"AWS_ACCESS_KEY_ID=foo",
-			"AWS_SECRET_ACCESS_KEY=bar",
-		)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		bucket := fmt.Sprintf("s3-%s", doID)
 
-		if err := cmd.Start(); err != nil {
-			log.Fatalf("Failed to start tigrisfs: %v", err)
+		// os.Stat("/home/cutie")
+
+		go func() {
+			// Use Durable Object ID as the S3 bucket name for per-computer isolation
+			cmd := exec.Command("/usr/local/bin/tigrisfs",
+				"--endpoint", "https://cute.maxmcd.com/",
+				"-f",
+				bucket,
+				"/home/cutie")
+			cmd.Env = append(os.Environ(),
+				"AWS_ACCESS_KEY_ID=no",
+				"AWS_SECRET_ACCESS_KEY=no",
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Run(); err != nil {
+				log.Fatalf("tigrisfs failed: %v", err)
+			}
+			log.Fatalf("tigrisfs exited unexpectedly")
+		}()
+
+		// Wait for FUSE mount to be ready before proceeding
+		log.Printf("Waiting for FUSE mount at /home/cutie...")
+		if err := waitForMount("/home/cutie", 10*time.Second); err != nil {
+			log.Fatalf("Failed to wait for mount: %v", err)
 		}
+	}
+
+	// Ensure config file exists with defaults
+	if err := ensureConfigExists(); err != nil {
+		log.Printf("Warning: Failed to ensure config exists: %v", err)
 	}
 
 	// WebSocket endpoint for PTY

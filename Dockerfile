@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     cd ./container_src && go build -o /server .
 
 FROM debian:trixie
-RUN apt-get update && apt-get install -y curl unzip ca-certificates fuse \
+RUN apt-get update && apt-get install -y curl unzip media-types ca-certificates fuse \
 	&& rm -rf /var/lib/apt/lists/*
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
@@ -32,5 +32,7 @@ COPY --from=builder /server /server
 WORKDIR /opt
 
 EXPOSE 8283
+
+USER cutie
 # Run server as root, but shell sessions will run as cutie
 CMD ["/server"]

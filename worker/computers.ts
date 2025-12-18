@@ -1,5 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 
+export type Computer = {
+  id: number;
+  name: string;
+  created_at: number;
+};
+
 export class Computers extends DurableObject<Env> {
   sql: SqlStorage;
 
@@ -27,7 +33,7 @@ export class Computers extends DurableObject<Env> {
 
   async createComputer(): Promise<{
     success: boolean;
-    computer?: { id: number; name: string; created_at: number };
+    computer?: Computer;
     error?: string;
   }> {
     // Import unique-names-generator dynamically
@@ -53,16 +59,16 @@ export class Computers extends DurableObject<Env> {
         this.sql.exec(
           `INSERT INTO computers (name, created_at) VALUES (?, ?)`,
           name,
-          created_at,
+          created_at
         );
 
         // Get the inserted computer
         const computer = this.sql
           .exec(
             `SELECT id, name, created_at FROM computers WHERE name = ?`,
-            name,
+            name
           )
-          .one() as { id: number; name: string; created_at: number };
+          .one() as Computer;
 
         return {
           success: true,
@@ -87,12 +93,10 @@ export class Computers extends DurableObject<Env> {
     };
   }
 
-  async getComputer(
-    name: string,
-  ): Promise<{ id: number; name: string; created_at: number } | null> {
+  async getComputer(name: string): Promise<Computer | null> {
     const computer = this.sql
       .exec(`SELECT id, name, created_at FROM computers WHERE name = ?`, name)
-      .one() as { id: number; name: string; created_at: number } | null;
+      .one() as Computer | null;
 
     return computer;
   }
@@ -102,7 +106,7 @@ export class Computers extends DurableObject<Env> {
   > {
     const computers = this.sql
       .exec(
-        `SELECT id, name, created_at FROM computers ORDER BY created_at DESC`,
+        `SELECT id, name, created_at FROM computers ORDER BY created_at DESC`
       )
       .toArray() as { id: number; name: string; created_at: number }[];
 

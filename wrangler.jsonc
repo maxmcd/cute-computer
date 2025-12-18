@@ -36,6 +36,16 @@
       },
     ],
   },
+  "routes": [
+    {
+      "pattern": "cute.maxmcd.com/*",
+      "zone_name": "maxmcd.com",
+    },
+    {
+      "pattern": "*.cute.maxmcd.com/*",
+      "zone_name": "maxmcd.com",
+    },
+  ],
   "migrations": [
     {
       "new_sqlite_classes": ["AppContainer", "S3"],
