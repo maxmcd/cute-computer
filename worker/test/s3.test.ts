@@ -326,21 +326,35 @@ describe("S3 with AWS SDK", () => {
     ).rejects.toThrow();
   });
 
-  it("handles keys with special characters", async () => {
+  it("handles keys with special characters and URL encoding", async () => {
     const s3Client = createS3Client("special-chars-test");
     const bucket = "test-bucket";
     const key = "path/to/file with spaces & special-chars!.txt";
     const content = "special content";
 
+    // PUT object (SDK will URL-encode the key in the request)
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: key, Body: content })
     );
 
+    // GET object (SDK will URL-encode the key in the request)
     const getResult = await s3Client.send(
       new GetObjectCommand({ Bucket: bucket, Key: key })
     );
     const retrieved = await getResult.Body?.transformToString();
     expect(retrieved).toBe(content);
+
+    // List objects to verify the key is stored decoded (not URL-encoded)
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket })
+    );
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys.length).toBe(1);
+    expect(keys[0]).toBe(key); // Should be decoded, with actual spaces and special chars
+    // Verify no URL encoding in the stored key
+    expect(keys[0]?.includes("%20")).toBe(false); // Should NOT contain URL-encoded space
+    expect(keys[0]?.includes("%26")).toBe(false); // Should NOT contain URL-encoded &
+    expect(keys[0]?.includes("%21")).toBe(false); // Should NOT contain URL-encoded !
   });
 
   it("preserves trailing slashes in keys for directory markers", async () => {

@@ -1,4 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import { FileTree } from "../components/FileTree";
+import { CodeEditor } from "../components/CodeEditor";
+import {
+  fetchDurableObjectId,
+  listS3Objects,
+  getS3Object,
+  putS3Object,
+} from "../lib/s3";
+import { buildFileTree, sortTreeNodes, detectLanguage } from "../lib/file-tree";
+import type { TreeNode } from "../lib/file-tree";
 
 export function meta({ params }: any) {
   return [
@@ -12,13 +22,30 @@ export default function Computer({ params }: any) {
   const terminalRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const fitAddonRef = useRef<any>(null);
-  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
+    null
+  );
   const [status, setStatus] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");
   const [statusText, setStatusText] = useState("Connecting...");
   const [reconnectMessage, setReconnectMessage] = useState("");
   const [subdomainUrl, setSubdomainUrl] = useState("");
+
+  // Editor state
+  const [doId, setDoId] = useState<string>("");
+  const [fileTree, setFileTree] = useState<TreeNode[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [fileContent, setFileContent] = useState<string>("");
+  const [originalContent, setOriginalContent] = useState<string>("");
+  const [isDirty, setIsDirty] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [loadingFiles, setLoadingFiles] = useState(true);
+  const [loadingFileContent, setLoadingFileContent] = useState(false);
+  const [editorError, setEditorError] = useState<string>("");
+
+  // File content cache - keep last 10 files in memory
+  const fileCacheRef = useRef<Map<string, string>>(new Map());
 
   const computerName = params.name;
 
@@ -45,9 +72,12 @@ export default function Computer({ params }: any) {
         rows: 24,
         fontFamily: "JetBrains Mono, Menlo, Monaco, monospace",
         fontSize: 14,
+        cursorBlink: true,
+        cursorStyle: "block",
         theme: {
-          background: "#1e1e1e",
-          foreground: "#d4d4d4",
+          background: "#ffffff",
+          foreground: "#1f2937",
+          cursor: "#ec489960",
         },
       });
 
@@ -194,6 +224,228 @@ export default function Computer({ params }: any) {
     };
   }, []);
 
+  // Initialize editor: fetch DO ID and load file tree
+  useEffect(() => {
+    async function initEditor() {
+      try {
+        setLoadingFiles(true);
+        setEditorError("");
+
+        // Get Durable Object ID
+        const id = await fetchDurableObjectId(computerName);
+        setDoId(id);
+
+        // List all files (no prefix needed)
+        const objects = await listS3Objects(id, "");
+        const keys = objects.map((obj) => obj.key);
+
+        // Build and sort tree
+        const tree = buildFileTree(keys);
+        const sortedTree = sortTreeNodes(tree);
+        setFileTree(sortedTree);
+      } catch (error) {
+        console.error("Failed to initialize editor:", error);
+        setEditorError(
+          error instanceof Error ? error.message : "Failed to load files"
+        );
+      } finally {
+        setLoadingFiles(false);
+      }
+    }
+
+    initEditor();
+  }, [computerName]);
+
+  // Note: File loading now happens in handleFileSelect before selectedFile changes
+  // This ensures content is always ready when selectedFile updates
+
+  // Handle file content changes
+  const handleContentChange = (newContent: string) => {
+    setFileContent(newContent);
+    setIsDirty(newContent !== originalContent);
+  };
+
+  // Save file to S3
+  const handleSave = async () => {
+    if (!selectedFile || !doId || !isDirty) return;
+
+    try {
+      setIsSaving(true);
+      setEditorError("");
+      await putS3Object(doId, selectedFile, fileContent);
+      setOriginalContent(fileContent);
+      setIsDirty(false);
+      // Update cache with saved content
+      fileCacheRef.current.set(selectedFile, fileContent);
+    } catch (error) {
+      console.error("Failed to save file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to save file"
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Auto-save on interval (500ms after last change)
+  useEffect(() => {
+    if (!selectedFile || !doId || !isDirty) return;
+
+    const autoSaveTimer = setTimeout(async () => {
+      try {
+        setIsSaving(true);
+        await putS3Object(doId, selectedFile, fileContent);
+        setOriginalContent(fileContent);
+        setIsDirty(false);
+        // Update cache with saved content
+        fileCacheRef.current.set(selectedFile, fileContent);
+      } catch (error) {
+        console.error("Auto-save failed:", error);
+      } finally {
+        setIsSaving(false);
+      }
+    }, 500); // 500ms delay after last change
+
+    return () => clearTimeout(autoSaveTimer);
+  }, [fileContent, selectedFile, doId, isDirty]);
+
+  // Handle file selection from tree
+  const handleFileSelect = async (filePath: string) => {
+    if (!doId) return;
+
+    // Auto-save current file before switching
+    if (isDirty && selectedFile && doId) {
+      try {
+        await putS3Object(doId, selectedFile, fileContent);
+        setOriginalContent(fileContent);
+        setIsDirty(false);
+        // Update cache with saved content
+        fileCacheRef.current.set(selectedFile, fileContent);
+      } catch (error) {
+        console.error("Failed to auto-save before switching files:", error);
+      }
+    }
+
+    // Load new file content FIRST (before changing selectedFile)
+    try {
+      setEditorError("");
+
+      // Check cache first
+      const cached = fileCacheRef.current.get(filePath);
+      if (cached !== undefined) {
+        // Cache hit - load instantly
+        setFileContent(cached);
+        setOriginalContent(cached);
+        setIsDirty(false);
+        setLoadingFileContent(false);
+      } else {
+        // Cache miss - fetch from S3
+        setLoadingFileContent(true);
+        const content = await getS3Object(doId, filePath);
+
+        // Update cache (LRU: if cache is full, remove oldest entry)
+        if (fileCacheRef.current.size >= 10) {
+          const firstKey = fileCacheRef.current.keys().next().value;
+          if (firstKey) {
+            fileCacheRef.current.delete(firstKey);
+          }
+        }
+        fileCacheRef.current.set(filePath, content);
+
+        setFileContent(content);
+        setOriginalContent(content);
+        setIsDirty(false);
+        setLoadingFileContent(false);
+      }
+    } catch (error) {
+      console.error("Failed to load file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to load file"
+      );
+      setLoadingFileContent(false);
+      return; // Don't change selected file if loading failed
+    }
+
+    // THEN change selected file (content is guaranteed to be ready)
+    setSelectedFile(filePath);
+  };
+
+  // Refresh file tree
+  const refreshFileTree = async () => {
+    if (!doId) return;
+
+    try {
+      setLoadingFiles(true);
+      const objects = await listS3Objects(doId, "");
+      const keys = objects.map((obj) => obj.key);
+      const tree = buildFileTree(keys);
+      const sortedTree = sortTreeNodes(tree);
+      setFileTree(sortedTree);
+    } catch (error) {
+      console.error("Failed to refresh file tree:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to refresh files"
+      );
+    } finally {
+      setLoadingFiles(false);
+    }
+  };
+
+  // Create new file
+  const handleCreateFile = async () => {
+    if (!doId) return;
+
+    const fileName = window.prompt("Enter file name (e.g., script.js):");
+    if (!fileName) return;
+
+    // Remove leading slash if present
+    const cleanFileName = fileName.replace(/^\/+/, "");
+
+    try {
+      setEditorError("");
+      // Create empty file
+      await putS3Object(doId, cleanFileName, "");
+      await refreshFileTree();
+      // Auto-select the new file
+      setSelectedFile(cleanFileName);
+    } catch (error) {
+      console.error("Failed to create file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to create file"
+      );
+    }
+  };
+
+  // Create new folder
+  const handleCreateFolder = async () => {
+    if (!doId) return;
+
+    const folderName = window.prompt("Enter folder name (e.g., src):");
+    if (!folderName) return;
+
+    // Remove leading/trailing slashes and add trailing slash for folder
+    const cleanFolderName = folderName.replace(/^\/+|\/+$/g, "");
+    const folderPath = `${cleanFolderName}/`;
+
+    try {
+      setEditorError("");
+      // Create empty S3 object with trailing slash to represent folder
+      await putS3Object(doId, folderPath, "");
+      await refreshFileTree();
+    } catch (error) {
+      console.error("Failed to create folder:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to create folder"
+      );
+    }
+  };
+
+  // Detect language from selected file
+  const currentLanguage = selectedFile ? detectLanguage(selectedFile) : "text";
+  const fileName = selectedFile
+    ? selectedFile.split("/").pop() || "No file selected"
+    : "No file selected";
+
   return (
     <div className="min-h-screen w-full flex flex-col bg-gradient-to-br from-pink-200 via-purple-200 to-indigo-300">
       <style>{`
@@ -257,8 +509,8 @@ export default function Computer({ params }: any) {
       </div>
 
       {/* Terminal centered in remaining space */}
-      <div className="flex-1 flex items-center justify-center px-10 md:px-5 pb-10">
-        <div className="terminal-window w-full max-w-4xl bg-[#1e1e1e] rounded-xl shadow-2xl overflow-hidden">
+      <div className="flex items-center justify-center px-10 md:px-5 pb-5">
+        <div className="terminal-window w-full max-w-4xl bg-white rounded-xl shadow-2xl overflow-hidden">
           {/* Title Bar */}
           <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400">
             {/* Traffic Lights */}
@@ -296,8 +548,90 @@ export default function Computer({ params }: any) {
           {/* Terminal Content */}
           <div
             ref={containerRef}
-            className="h-[600px] md:h-[500px] p-4 bg-[#1e1e1e] relative overflow-hidden"
+            className="h-[600px] md:h-[500px] p-4 bg-white relative overflow-hidden"
+            style={{
+              caretColor: "transparent",
+            }}
           ></div>
+        </div>
+      </div>
+
+      {/* Editor Window */}
+      <div className="flex items-start justify-center px-10 md:px-5 pb-10">
+        <div className="w-full max-w-4xl bg-white rounded-xl shadow-2xl overflow-hidden">
+          {/* Title Bar */}
+          <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400">
+            {/* Traffic Lights */}
+            <div className="flex gap-2">
+              <div className="w-3 h-3 rounded-full bg-pink-400"></div>
+              <div className="w-3 h-3 rounded-full bg-purple-400"></div>
+              <div className="w-3 h-3 rounded-full bg-indigo-400"></div>
+            </div>
+
+            {/* Title */}
+            <span className="flex-1 text-center text-purple-900 text-[13px] font-medium tracking-wide">
+              {fileName}
+            </span>
+
+            {/* Save Status */}
+            <div className="ml-auto text-xs text-purple-700 font-medium">
+              {isSaving ? "Saving..." : isDirty ? "Unsaved" : "Saved"}
+            </div>
+          </div>
+
+          {/* Editor Content - Split between tree and editor */}
+          <div className="flex h-[500px]">
+            {/* File Tree - Left Panel */}
+            <div className="w-[30%] border-r border-gray-300 overflow-auto">
+              {loadingFiles ? (
+                <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+                  Loading files...
+                </div>
+              ) : editorError && fileTree.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-red-600 text-sm p-4 text-center">
+                  {editorError}
+                </div>
+              ) : fileTree.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-gray-600 text-sm p-4 text-center">
+                  No files found
+                  <br />
+                  Use the buttons above to create files
+                </div>
+              ) : (
+                <FileTree
+                  data={fileTree}
+                  onFileSelect={handleFileSelect}
+                  selectedFile={selectedFile}
+                  onCreateFile={handleCreateFile}
+                  onCreateFolder={handleCreateFolder}
+                />
+              )}
+            </div>
+
+            {/* Code Editor - Right Panel */}
+            <div className="flex-1 relative">
+              {!selectedFile ? (
+                <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+                  Select a file to edit
+                </div>
+              ) : editorError ? (
+                <div className="flex items-center justify-center h-full text-red-600 text-sm p-4 text-center">
+                  {editorError}
+                </div>
+              ) : loadingFileContent ? (
+                <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+                  Loading file...
+                </div>
+              ) : (
+                <CodeEditor
+                  key={selectedFile}
+                  value={fileContent}
+                  onChange={handleContentChange}
+                  language={currentLanguage}
+                />
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

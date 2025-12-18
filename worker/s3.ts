@@ -72,6 +72,8 @@ export class S3 extends DurableObject<Env> {
     let key = "";
     if (url.pathname.startsWith(bucketPrefix + "/")) {
       key = url.pathname.slice(bucketPrefix.length + 1);
+      // Decode URL-encoded characters (e.g., %20 -> space)
+      key = decodeURIComponent(key);
     } else if (url.pathname === bucketPrefix) {
       key = "";
     }
