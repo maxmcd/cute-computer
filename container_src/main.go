@@ -673,6 +673,12 @@ func main() {
 		}
 		log.Printf("Using Durable Object ID as S3 bucket: %s", doID)
 
+		// Get S3 auth token
+		s3Token := os.Getenv("S3_AUTH_TOKEN")
+		if s3Token == "" {
+			log.Fatalf("S3_AUTH_TOKEN not set")
+		}
+
 		// Create mount point directory
 		if err := os.MkdirAll("/home/cutie", 0755); err != nil {
 			log.Fatalf("Failed to create directory: %v", err)
@@ -689,9 +695,13 @@ func main() {
 				"-f",
 				bucket,
 				"/home/cutie")
+			// Pass JWT token as AWS access key ID
+			// tigrisfs will include this in the Authorization header's Credential field
+			// Format: "AWS4-HMAC-SHA256 Credential=<jwt>/20231201/auto/s3/aws4_request, ..."
+			// Our S3 DO extracts the JWT from the Credential field
 			cmd.Env = append(os.Environ(),
-				"AWS_ACCESS_KEY_ID=no",
-				"AWS_SECRET_ACCESS_KEY=no",
+				"AWS_ACCESS_KEY_ID="+s3Token,
+				"AWS_SECRET_ACCESS_KEY=not-used", // Required by tigrisfs but ignored by S3 DO
 			)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr

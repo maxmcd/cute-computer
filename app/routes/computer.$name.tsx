@@ -1,39 +1,87 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate, useParams, useLoaderData } from "react-router";
+import type { LoaderFunctionArgs } from "react-router";
 import { FileTree } from "../components/FileTree";
 import { CodeEditor } from "../components/CodeEditor";
+import { Window } from "../components/Window";
+import { ViewContainer } from "../components/ViewContainer";
 import {
   fetchDurableObjectId,
+  fetchComputerDetails,
   listS3Objects,
   getS3Object,
   putS3Object,
+  deleteS3Object,
 } from "../lib/s3";
-import { buildFileTree, sortTreeNodes, detectLanguage } from "../lib/file-tree";
+import {
+  buildFileTree,
+  sortTreeNodes,
+  detectLanguage,
+  moveFileInTree,
+} from "../lib/file-tree";
 import type { TreeNode } from "../lib/file-tree";
 
-export function meta({ params }: any) {
+export async function loader({ params, context, request }: LoaderFunctionArgs) {
+  const { name } = params;
+
+  if (!name) {
+    throw new Response("Computer not found", { status: 404 });
+  }
+
+  const env = context.cloudflare.env;
+
+  // Verify computer exists
+  const computersStub = env.COMPUTERS.get(env.COMPUTERS.idFromName("global"));
+  const computer = await computersStub.getComputer(name);
+
+  if (!computer) {
+    throw new Response("Computer not found", { status: 404 });
+  }
+
+  // Extract host from request
+  const url = new URL(request.url);
+  const host = url.host;
+
+  return {
+    computerName: computer.name,
+    computerSlug: computer.slug,
+    createdAt: computer.created_at,
+    host: host,
+  };
+}
+
+export function meta({ data }: any) {
   return [
-    { title: `${params.name} - Cute Computer` },
+    { title: `${data?.computerName || "Computer"} - Cute Computer` },
     { name: "description", content: "" },
   ];
 }
 
-export default function Computer({ params }: any) {
+type ViewType = "terminal" | "editor" | "logs" | "preview";
+
+export default function Computer() {
+  const navigate = useNavigate();
+  const params = useParams();
+  const loaderData = useLoaderData<typeof loader>();
+  const computerName = params.name!; // This is the slug
+  const splat = params["*"] || "";
+  const view = (splat || "landing") as ViewType | "landing";
+
+  // Terminal state
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const fitAddonRef = useRef<any>(null);
-  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
-    null
-  );
   const [status, setStatus] = useState<
     "connecting" | "connected" | "disconnected"
   >("connecting");
   const [statusText, setStatusText] = useState("Connecting...");
   const [reconnectMessage, setReconnectMessage] = useState("");
-  const [subdomainUrl, setSubdomainUrl] = useState("");
 
-  // View state
-  const [currentView, setCurrentView] = useState<"landing" | "terminal" | "editor" | "logs" | "preview">("landing");
+  // Computer display name from loader
+  const computerDisplayName = loaderData.computerName;
+  const createdAt = loaderData.createdAt;
+  const host = loaderData.host;
 
   // Editor state
   const [doId, setDoId] = useState<string>("");
@@ -46,26 +94,23 @@ export default function Computer({ params }: any) {
   const [loadingFiles, setLoadingFiles] = useState(true);
   const [loadingFileContent, setLoadingFileContent] = useState(false);
   const [editorError, setEditorError] = useState<string>("");
-
-  // File content cache - keep last 10 files in memory
+  const [treeOpenState, setTreeOpenState] = useState<{ [id: string]: boolean }>(
+    {}
+  );
   const fileCacheRef = useRef<Map<string, string>>(new Map());
 
-  const computerName = params.name;
-
+  const subdomainUrl = `http://${computerName}.${host}`;
+  // Initialize terminal (only when terminal view is active)
   useEffect(() => {
-    // Set subdomain URL on client side only
-    if (typeof window !== "undefined") {
-      setSubdomainUrl(`http://${computerName}.${window.location.host}`);
-    }
+    if (view !== "terminal") return;
+    if (!containerRef.current) return;
 
     let mounted = true;
 
     async function initTerminal() {
       if (!containerRef.current) return;
 
-      // Dynamic import ghostty-web
       const { init, Terminal, FitAddon } = await import("ghostty-web");
-
       if (!mounted) return;
 
       await init();
@@ -80,7 +125,7 @@ export default function Computer({ params }: any) {
         theme: {
           background: "#ffffff",
           foreground: "#1f2937",
-          cursor: "#ec489960",
+          cursor: "#e879f9",
         },
       });
 
@@ -94,7 +139,6 @@ export default function Computer({ params }: any) {
       terminalRef.current = term;
       fitAddonRef.current = fitAddon;
 
-      // Connect to WebSocket
       function connect() {
         setStatus("connecting");
         setStatusText("Connecting...");
@@ -130,84 +174,34 @@ export default function Computer({ params }: any) {
 
       connect();
 
-      // Send terminal input to server
       term.onData((data: string) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(data);
         }
       });
 
-      // Handle resize - notify PTY when terminal dimensions change
       term.onResize(({ cols, rows }: { cols: number; rows: number }) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({ type: "resize", cols, rows }));
         }
       });
 
-      // Debounce function for resize events
       let resizeTimeout: ReturnType<typeof setTimeout>;
       function debouncedFit() {
         clearTimeout(resizeTimeout);
-        resizeTimeout = setTimeout(() => {
-          fitAddon.fit();
-        }, 50);
+        resizeTimeout = setTimeout(() => fitAddon.fit(), 50);
       }
 
-      // Handle window resize
       window.addEventListener("resize", debouncedFit);
-
-      // Use ResizeObserver for more reliable resize detection
       const resizeObserver = new ResizeObserver(debouncedFit);
       if (containerRef.current) {
         resizeObserver.observe(containerRef.current);
       }
 
-      // Handle mobile keyboard showing/hiding using visualViewport API
-      if (window.visualViewport) {
-        const terminalContent = containerRef.current;
-        const terminalWindow = terminalContent?.closest(
-          ".terminal-window"
-        ) as HTMLElement;
-        const body = document.body;
-
-        let viewportResizeTimeout: ReturnType<typeof setTimeout>;
-        window.visualViewport.addEventListener("resize", () => {
-          const keyboardHeight =
-            window.innerHeight - window.visualViewport!.height;
-          if (keyboardHeight > 100) {
-            body.style.padding = "0";
-            body.style.alignItems = "flex-start";
-            if (terminalWindow) {
-              terminalWindow.style.borderRadius = "0";
-              terminalWindow.style.maxWidth = "100%";
-            }
-            if (terminalContent) {
-              terminalContent.style.height = `${window.visualViewport!.height - 60}px`;
-            }
-            window.scrollTo(0, 0);
-          } else {
-            body.style.padding = "40px 20px";
-            body.style.alignItems = "center";
-            if (terminalWindow) {
-              terminalWindow.style.borderRadius = "12px";
-              terminalWindow.style.maxWidth = "1000px";
-            }
-            if (terminalContent) {
-              terminalContent.style.height = "600px";
-            }
-          }
-
-          // Debounced fit for viewport changes
-          clearTimeout(viewportResizeTimeout);
-          viewportResizeTimeout = setTimeout(() => {
-            fitAddon.fit();
-          }, 100);
-        });
-      }
-
-      // Cleanup
       return () => {
         mounted = false;
+        window.removeEventListener("resize", debouncedFit);
+        resizeObserver.disconnect();
         if (wsRef.current) {
           wsRef.current.close();
         }
@@ -225,24 +219,22 @@ export default function Computer({ params }: any) {
         wsRef.current.close();
       }
     };
-  }, []);
+  }, [view, computerName]);
 
-  // Initialize editor: fetch DO ID and load file tree
+  // Initialize editor (only when needed)
   useEffect(() => {
+    if (view !== "editor") return;
+
     async function initEditor() {
       try {
         setLoadingFiles(true);
         setEditorError("");
 
-        // Get Durable Object ID
-        const id = await fetchDurableObjectId(computerName);
-        setDoId(id);
+        const details = await fetchComputerDetails(computerName);
+        setDoId(details.doId);
 
-        // List all files (no prefix needed)
-        const objects = await listS3Objects(id, "");
+        const objects = await listS3Objects(computerName, details.doId, "");
         const keys = objects.map((obj) => obj.key);
-
-        // Build and sort tree
         const tree = buildFileTree(keys);
         const sortedTree = sortTreeNodes(tree);
         setFileTree(sortedTree);
@@ -257,96 +249,60 @@ export default function Computer({ params }: any) {
     }
 
     initEditor();
-  }, [computerName]);
+  }, [view, computerName]);
 
-  // Note: File loading now happens in handleFileSelect before selectedFile changes
-  // This ensures content is always ready when selectedFile updates
-
-  // Handle file content changes
   const handleContentChange = (newContent: string) => {
     setFileContent(newContent);
     setIsDirty(newContent !== originalContent);
   };
 
-  // Save file to S3
-  const handleSave = async () => {
-    if (!selectedFile || !doId || !isDirty) return;
-
-    try {
-      setIsSaving(true);
-      setEditorError("");
-      await putS3Object(doId, selectedFile, fileContent);
-      setOriginalContent(fileContent);
-      setIsDirty(false);
-      // Update cache with saved content
-      fileCacheRef.current.set(selectedFile, fileContent);
-    } catch (error) {
-      console.error("Failed to save file:", error);
-      setEditorError(
-        error instanceof Error ? error.message : "Failed to save file"
-      );
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  // Auto-save on interval (500ms after last change)
+  // Auto-save
   useEffect(() => {
     if (!selectedFile || !doId || !isDirty) return;
 
     const autoSaveTimer = setTimeout(async () => {
       try {
         setIsSaving(true);
-        await putS3Object(doId, selectedFile, fileContent);
+        await putS3Object(computerName, doId, selectedFile, fileContent);
         setOriginalContent(fileContent);
         setIsDirty(false);
-        // Update cache with saved content
         fileCacheRef.current.set(selectedFile, fileContent);
       } catch (error) {
         console.error("Auto-save failed:", error);
       } finally {
         setIsSaving(false);
       }
-    }, 500); // 500ms delay after last change
+    }, 500);
 
     return () => clearTimeout(autoSaveTimer);
   }, [fileContent, selectedFile, doId, isDirty]);
 
-  // Handle file selection from tree
   const handleFileSelect = async (filePath: string) => {
     if (!doId) return;
 
-    // Auto-save current file before switching
     if (isDirty && selectedFile && doId) {
       try {
-        await putS3Object(doId, selectedFile, fileContent);
+        await putS3Object(computerName, doId, selectedFile, fileContent);
         setOriginalContent(fileContent);
         setIsDirty(false);
-        // Update cache with saved content
         fileCacheRef.current.set(selectedFile, fileContent);
       } catch (error) {
         console.error("Failed to auto-save before switching files:", error);
       }
     }
 
-    // Load new file content FIRST (before changing selectedFile)
     try {
       setEditorError("");
-
-      // Check cache first
       const cached = fileCacheRef.current.get(filePath);
       if (cached !== undefined) {
-        // Cache hit - load instantly
         setFileContent(cached);
         setOriginalContent(cached);
         setIsDirty(false);
         setLoadingFileContent(false);
       } else {
-        // Cache miss - fetch from S3
         setLoadingFileContent(true);
-        const content = await getS3Object(doId, filePath);
+        const content = await getS3Object(computerName, doId, filePath);
 
-        // Update cache (LRU: if cache is full, remove oldest entry)
         if (fileCacheRef.current.size >= 10) {
           const firstKey = fileCacheRef.current.keys().next().value;
           if (firstKey) {
@@ -366,20 +322,18 @@ export default function Computer({ params }: any) {
         error instanceof Error ? error.message : "Failed to load file"
       );
       setLoadingFileContent(false);
-      return; // Don't change selected file if loading failed
+      return;
     }
 
-    // THEN change selected file (content is guaranteed to be ready)
     setSelectedFile(filePath);
   };
 
-  // Refresh file tree
   const refreshFileTree = async () => {
     if (!doId) return;
 
     try {
       setLoadingFiles(true);
-      const objects = await listS3Objects(doId, "");
+      const objects = await listS3Objects(computerName, doId, "");
       const keys = objects.map((obj) => obj.key);
       const tree = buildFileTree(keys);
       const sortedTree = sortTreeNodes(tree);
@@ -394,22 +348,22 @@ export default function Computer({ params }: any) {
     }
   };
 
-  // Create new file
   const handleCreateFile = async () => {
     if (!doId) return;
 
     const fileName = window.prompt("Enter file name (e.g., script.js):");
     if (!fileName) return;
 
-    // Remove leading slash if present
     const cleanFileName = fileName.replace(/^\/+/, "");
 
     try {
       setEditorError("");
-      // Create empty file
-      await putS3Object(doId, cleanFileName, "");
+      await putS3Object(computerName, doId, cleanFileName, "");
       await refreshFileTree();
-      // Auto-select the new file
+      // Clear content and select new file
+      setFileContent("");
+      setOriginalContent("");
+      setIsDirty(false);
       setSelectedFile(cleanFileName);
     } catch (error) {
       console.error("Failed to create file:", error);
@@ -419,21 +373,18 @@ export default function Computer({ params }: any) {
     }
   };
 
-  // Create new folder
   const handleCreateFolder = async () => {
     if (!doId) return;
 
     const folderName = window.prompt("Enter folder name (e.g., src):");
     if (!folderName) return;
 
-    // Remove leading/trailing slashes and add trailing slash for folder
     const cleanFolderName = folderName.replace(/^\/+|\/+$/g, "");
     const folderPath = `${cleanFolderName}/`;
 
     try {
       setEditorError("");
-      // Create empty S3 object with trailing slash to represent folder
-      await putS3Object(doId, folderPath, "");
+      await putS3Object(computerName, doId, folderPath, "");
       await refreshFileTree();
     } catch (error) {
       console.error("Failed to create folder:", error);
@@ -443,147 +394,327 @@ export default function Computer({ params }: any) {
     }
   };
 
-  // Detect language from selected file
+  const handleDeleteFile = async () => {
+    if (!selectedFile || !doId) return;
+
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${selectedFile}"?`
+    );
+    if (!confirmed) return;
+
+    try {
+      setEditorError("");
+      await deleteS3Object(computerName, doId, selectedFile);
+
+      // Clear selection and refresh tree
+      fileCacheRef.current.delete(selectedFile);
+      setSelectedFile(null);
+      setFileContent("");
+      setOriginalContent("");
+      setIsDirty(false);
+      await refreshFileTree();
+    } catch (error) {
+      console.error("Failed to delete file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to delete file"
+      );
+    }
+  };
+
+  const handleRenameFile = async () => {
+    if (!selectedFile || !doId) return;
+
+    const newName = window.prompt("Enter new file name:", selectedFile);
+    if (!newName || newName === selectedFile) return;
+
+    const cleanNewName = newName.replace(/^\/+/, "");
+
+    try {
+      setEditorError("");
+
+      // Create new file with same content
+      await putS3Object(computerName, doId, cleanNewName, fileContent);
+
+      // Delete old file
+      await deleteS3Object(computerName, doId, selectedFile);
+
+      // Update cache
+      fileCacheRef.current.delete(selectedFile);
+      fileCacheRef.current.set(cleanNewName, fileContent);
+
+      // Update selection and refresh
+      setSelectedFile(cleanNewName);
+      setOriginalContent(fileContent);
+      setIsDirty(false);
+      await refreshFileTree();
+    } catch (error) {
+      console.error("Failed to rename file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to rename file"
+      );
+    }
+  };
+
+  const handleMoveFile = async (fromPath: string, toFolder: string) => {
+    if (!doId) return;
+    try {
+      setEditorError("");
+
+      // Calculate new path
+      const fileName = fromPath.split("/").pop();
+      if (!fileName) {
+        throw new Error("Invalid file path");
+      }
+      const newPath = toFolder ? `${toFolder}/${fileName}` : fileName;
+
+      // Don't move if it's the same location
+      if (newPath === fromPath) {
+        console.log("Same location, skipping");
+        return;
+      }
+
+      // Update tree immediately without server round-trip
+      const updatedTree = moveFileInTree(fileTree, fromPath, toFolder);
+      setFileTree(updatedTree);
+
+      // Update selection if moving currently selected file
+      if (selectedFile === fromPath) {
+        setSelectedFile(newPath);
+      }
+
+      // Now perform server operations in background
+      const content = await getS3Object(computerName, doId, fromPath);
+
+      await putS3Object(computerName, doId, newPath, content);
+
+      await deleteS3Object(computerName, doId, fromPath);
+
+      // Update cache
+      fileCacheRef.current.delete(fromPath);
+      fileCacheRef.current.set(newPath, content);
+
+      // Update file content if this was the selected file
+      if (selectedFile === fromPath) {
+        setFileContent(content);
+        setOriginalContent(content);
+      }
+
+      console.log("Move complete");
+    } catch (error) {
+      console.error("Failed to move file:", error);
+      setEditorError(
+        error instanceof Error ? error.message : "Failed to move file"
+      );
+
+      // On error, refresh tree from server to get correct state
+      await refreshFileTree();
+    }
+  };
+
   const currentLanguage = selectedFile ? detectLanguage(selectedFile) : "text";
   const fileName = selectedFile
     ? selectedFile.split("/").pop() || "No file selected"
     : "No file selected";
 
-  return (
-    <div className="min-h-screen w-full flex flex-col bg-gradient-to-br from-pink-200 via-purple-200 to-indigo-300">
-      <style>{`
-        body {
-          background: linear-gradient(135deg, #fbcfe8 0%, #e9d5ff 50%, #c7d2fe 100%);
-          margin: 0;
-        }
-        @keyframes pulse {
-          0%, 100% {
-            opacity: 1;
-          }
-          50% {
-            opacity: 0.5;
-          }
-        }
-        .animate-pulse-dot {
-          animation: pulse 1s infinite;
-        }
-      `}</style>
+  const handleCloseView = () => {
+    navigate(`/computer/${computerName}`);
+  };
 
-      {/* Header with Logo at top */}
-      <div className="w-full px-10 md:px-5 py-6">
-        <div className="max-w-4xl mx-auto flex items-center justify-between">
+  // Landing page view
+  if (view === "landing") {
+    return (
+      <div className="min-h-screen w-full flex flex-col bg-gradient-to-br from-pink-200 via-purple-200 to-indigo-300">
+        <style>{`
+          body {
+            background: linear-gradient(135deg, #fbcfe8 0%, #e9d5ff 50%, #c7d2fe 100%);
+            margin: 0;
+          }
+        `}</style>
+
+        {/* Cute Computer Title Bar */}
+        <div className="w-full px-10 py-6">
           <a
             href="/"
-            className="flex items-center gap-3 hover:opacity-80 transition-opacity"
+            className="flex items-center gap-3 hover:opacity-80 transition-opacity font-mono"
           >
-            <span className="text-2xl text-purple-900 font-mono">
-              &gt;_&lt;
-            </span>
+            <span className="text-2xl text-purple-900">{">_<"}</span>
             <h1 className="text-2xl font-bold text-purple-900">
               Cute Computer
             </h1>
           </a>
+        </div>
 
-          {/* Subdomain Link */}
-          {subdomainUrl && (
-            <a
-              href={subdomainUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 px-4 py-2 bg-white/90 hover:bg-white rounded-lg shadow-md hover:shadow-lg transition-all text-purple-700 font-medium text-sm"
+        {/* Content Container */}
+        <div className="flex-1 flex flex-col items-center justify-center px-10 gap-8 pb-10">
+          {/* Computer Info Panel */}
+          <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl p-8 font-mono">
+            <div>
+              <div className="space-y-2 text-sm pb-1 text-gray-500">
+                computer
+              </div>
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">
+                {computerDisplayName}
+              </h2>
+
+              <div className="space-y-2 text-sm">
+                <div className="text-gray-900">
+                  created:{" "}
+                  <span className="text-gray-900">
+                    {new Date(createdAt).toLocaleDateString()} at{" "}
+                    {new Date(createdAt).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div className="">
+                  <span className="text-gray-900 whitespace-nowrap">
+                    address:{" "}
+                  </span>
+                  <a
+                    href={subdomainUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-purple-600 hover:text-purple-800 underline break-all"
+                  >
+                    {subdomainUrl}
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* View Icons */}
+          <div className="grid grid-cols-4 gap-4 w-full max-w-2xl">
+            <button
+              onClick={() => navigate(`/computer/${computerName}/terminal`)}
+              className="flex flex-col items-center gap-2 p-6 rounded-xl hover:bg-purple-50 transition-colors group cursor-pointer"
             >
-              <svg
-                className="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
-                />
-              </svg>
-              Open {subdomainUrl.replace("http://", "")}
-            </a>
-          )}
+              <img
+                src="/terminal.png"
+                alt="Terminal"
+                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                style={{
+                  filter:
+                    "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
+                }}
+              />
+              <span className="text-sm font-medium text-gray-700 group-hover:text-purple-900">
+                Terminal
+              </span>
+            </button>
+
+            <button
+              onClick={() => navigate(`/computer/${computerName}/editor`)}
+              className="flex flex-col items-center gap-2 p-6 rounded-xl hover:bg-purple-50 transition-colors group cursor-pointer"
+            >
+              <img
+                src="/editor.png"
+                alt="Editor"
+                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                style={{
+                  filter:
+                    "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
+                }}
+              />
+              <span className="text-sm font-medium text-gray-700 group-hover:text-purple-900">
+                Editor
+              </span>
+            </button>
+
+            <button
+              onClick={() => navigate(`/computer/${computerName}/logs`)}
+              className="flex flex-col items-center gap-2 p-6 rounded-xl hover:bg-purple-50 transition-colors group cursor-pointer"
+            >
+              <img
+                src="/logs.png"
+                alt="Logs"
+                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                style={{
+                  filter:
+                    "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
+                }}
+              />
+              <span className="text-sm font-medium text-gray-700 group-hover:text-purple-900">
+                Logs
+              </span>
+            </button>
+
+            <button
+              onClick={() => navigate(`/computer/${computerName}/preview`)}
+              className="flex flex-col items-center gap-2 p-6 rounded-xl hover:bg-purple-50 transition-colors group cursor-pointer"
+            >
+              <img
+                src="/preview.png"
+                alt="Preview"
+                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                style={{
+                  filter:
+                    "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
+                }}
+              />
+              <span className="text-sm font-medium text-gray-700 group-hover:text-purple-900">
+                Preview
+              </span>
+            </button>
+          </div>
         </div>
       </div>
+    );
+  }
 
-      {/* Terminal centered in remaining space */}
-      <div className="flex items-center justify-center px-10 md:px-5 pb-5">
-        <div className="terminal-window w-full max-w-4xl bg-white rounded-xl shadow-2xl overflow-hidden">
-          {/* Title Bar */}
-          <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400">
-            {/* Traffic Lights */}
-            <div className="flex gap-2">
-              <div className="w-3 h-3 rounded-full bg-pink-400"></div>
-              <div className="w-3 h-3 rounded-full bg-purple-400"></div>
-              <div className="w-3 h-3 rounded-full bg-indigo-400"></div>
-            </div>
-
-            {/* Title */}
-            <span className="flex-1 text-center text-purple-900 text-[13px] font-medium tracking-wide">
-              {computerName}
+  // Terminal view
+  if (view === "terminal") {
+    return (
+      <ViewContainer computerName={computerName}>
+        <Window
+          title={
+            <>
+              {computerDisplayName}
               {reconnectMessage && (
                 <span className="text-pink-600 text-xs ml-4">
                   {reconnectMessage}
                 </span>
               )}
-            </span>
-
-            {/* Connection Status */}
-            <div className="ml-auto flex items-center gap-1.5 text-[11px] text-purple-700">
+            </>
+          }
+          onClose={handleCloseView}
+          rightContent={
+            <div className="flex items-center gap-1.5 text-[11px] text-purple-700">
               <div
                 className={`w-2 h-2 rounded-full ${
                   status === "connected"
                     ? "bg-green-400"
                     : status === "disconnected"
                       ? "bg-pink-400"
-                      : "bg-purple-400 animate-pulse-dot"
+                      : "bg-purple-400"
                 }`}
               ></div>
               <span>{statusText}</span>
             </div>
-          </div>
-
-          {/* Terminal Content */}
+          }
+        >
           <div
             ref={containerRef}
-            className="h-[600px] md:h-[500px] p-4 bg-white relative overflow-hidden"
-            style={{
-              caretColor: "transparent",
-            }}
+            className="h-[600px] p-4 bg-white relative overflow-hidden"
+            style={{ caretColor: "transparent" }}
           ></div>
-        </div>
-      </div>
+        </Window>
+      </ViewContainer>
+    );
+  }
 
-      {/* Editor Window */}
-      <div className="flex items-start justify-center px-10 md:px-5 pb-10">
-        <div className="w-full max-w-4xl bg-white rounded-xl shadow-2xl overflow-hidden">
-          {/* Title Bar */}
-          <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400">
-            {/* Traffic Lights */}
-            <div className="flex gap-2">
-              <div className="w-3 h-3 rounded-full bg-pink-400"></div>
-              <div className="w-3 h-3 rounded-full bg-purple-400"></div>
-              <div className="w-3 h-3 rounded-full bg-indigo-400"></div>
-            </div>
-
-            {/* Title */}
-            <span className="flex-1 text-center text-purple-900 text-[13px] font-medium tracking-wide">
-              {fileName}
-            </span>
-
-            {/* Save Status */}
-            <div className="ml-auto text-xs text-purple-700 font-medium">
+  // Editor view
+  if (view === "editor") {
+    return (
+      <ViewContainer computerName={computerName}>
+        <Window
+          title={fileName}
+          onClose={handleCloseView}
+          rightContent={
+            <div className="text-xs text-purple-700 font-medium">
               {isSaving ? "Saving..." : isDirty ? "Unsaved" : "Saved"}
             </div>
-          </div>
-
-          {/* Editor Content - Split between tree and editor */}
-          <div className="flex h-[500px]">
+          }
+        >
+          <div className="flex h-[600px]">
             {/* File Tree - Left Panel */}
             <div className="w-[30%] border-r border-gray-300 overflow-auto">
               {loadingFiles ? (
@@ -594,12 +725,6 @@ export default function Computer({ params }: any) {
                 <div className="flex items-center justify-center h-full text-red-600 text-sm p-4 text-center">
                   {editorError}
                 </div>
-              ) : fileTree.length === 0 ? (
-                <div className="flex items-center justify-center h-full text-gray-600 text-sm p-4 text-center">
-                  No files found
-                  <br />
-                  Use the buttons above to create files
-                </div>
               ) : (
                 <FileTree
                   data={fileTree}
@@ -607,12 +732,38 @@ export default function Computer({ params }: any) {
                   selectedFile={selectedFile}
                   onCreateFile={handleCreateFile}
                   onCreateFolder={handleCreateFolder}
+                  onMoveFile={handleMoveFile}
+                  openState={treeOpenState}
+                  onOpenStateChange={setTreeOpenState}
                 />
               )}
             </div>
 
             {/* Code Editor - Right Panel */}
-            <div className="flex-1 relative">
+            <div className="flex-1 relative flex flex-col">
+              {/* File Actions Header */}
+              {selectedFile && (
+                <div className="flex items-center justify-between px-4 py-1 bg-gray-50 border-b border-gray-300">
+                  <div className="text-xs text-gray-600 font-mono">
+                    {selectedFile}
+                  </div>
+                  <div className="flex gap-3 text-xs font-mono">
+                    <button
+                      onClick={handleRenameFile}
+                      className="text-purple-600 hover:text-purple-800 underline"
+                    >
+                      rename
+                    </button>
+                    <button
+                      onClick={handleDeleteFile}
+                      className="text-purple-600 hover:text-purple-800 underline"
+                    >
+                      delete
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {!selectedFile ? (
                 <div className="flex items-center justify-center h-full text-gray-600 text-sm">
                   Select a file to edit
@@ -622,21 +773,58 @@ export default function Computer({ params }: any) {
                   {editorError}
                 </div>
               ) : loadingFileContent ? (
-                <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+                <div className="flex items-center justify-center flex-1 text-gray-600 text-sm">
                   Loading file...
                 </div>
               ) : (
-                <CodeEditor
-                  key={selectedFile}
-                  value={fileContent}
-                  onChange={handleContentChange}
-                  language={currentLanguage}
-                />
+                <div className="flex-1">
+                  <CodeEditor
+                    key={selectedFile}
+                    value={fileContent}
+                    onChange={handleContentChange}
+                    language={currentLanguage}
+                  />
+                </div>
               )}
             </div>
           </div>
-        </div>
-      </div>
-    </div>
-  );
+        </Window>
+      </ViewContainer>
+    );
+  }
+
+  // Logs view
+  if (view === "logs") {
+    return (
+      <ViewContainer computerName={computerName}>
+        <Window title="Logs" onClose={handleCloseView}>
+          <div className="h-[600px] p-4 bg-white overflow-auto font-mono text-sm">
+            <p className="text-gray-600">Container logs will appear here...</p>
+          </div>
+        </Window>
+      </ViewContainer>
+    );
+  }
+
+  // Preview view
+  if (view === "preview") {
+    return (
+      <ViewContainer computerName={computerName}>
+        <Window
+          title={`Preview - ${subdomainUrl.replace("http://", "")}`}
+          onClose={handleCloseView}
+        >
+          {subdomainUrl && (
+            <iframe
+              src={subdomainUrl}
+              className="w-full h-[600px] border-0"
+              title="Preview"
+            />
+          )}
+        </Window>
+      </ViewContainer>
+    );
+  }
+
+  return null;
 }

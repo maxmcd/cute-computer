@@ -14,7 +14,7 @@ export function CodeEditor({
   readOnly = false,
 }: CodeEditorProps) {
   return (
-    <div className="h-full overflow-hidden bg-white">
+    <div className="h-full overflow-hidden bg-white pt-1">
       <Editor
         value={value}
         onChange={(newValue) => onChange(newValue || "")}

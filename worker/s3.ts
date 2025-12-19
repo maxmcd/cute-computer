@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { verifyToken } from "./lib/jwt";
 
 interface S3Object {
   bucket: string;
@@ -14,6 +15,8 @@ const CHUNK_SIZE = 1024 * 1024; // 1MB chunks to stay under 2MB SQLite limit
 
 export class S3 extends DurableObject<Env> {
   sql: SqlStorage;
+  secretsCache: Map<string, string[]> = new Map();
+  
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.sql = state.storage.sql;
@@ -65,6 +68,95 @@ export class S3 extends DurableObject<Env> {
     }
 
     const bucket = pathParts[0];
+
+    // JWT Authentication
+    // Support two auth methods:
+    // 1. Bearer token: "Authorization: Bearer <jwt>"
+    // 2. AWS-style with JWT as accessKeyId: "Authorization: AWS4-HMAC-SHA256 Credential=<jwt>/..."
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader) {
+      return this.errorResponse("Unauthorized", "Missing authorization", 401);
+    }
+
+    let token: string;
+    if (authHeader.startsWith("Bearer ")) {
+      // Direct bearer token
+      token = authHeader.slice(7);
+    } else if (authHeader.startsWith("AWS4-HMAC-SHA256")) {
+      // Extract JWT from AWS signature Credential field
+      // Format: AWS4-HMAC-SHA256 Credential=<jwt>/20231201/auto/s3/aws4_request, ...
+      const credentialMatch = authHeader.match(/Credential=([^\/,]+)/);
+      if (!credentialMatch) {
+        return this.errorResponse("Unauthorized", "Invalid AWS authorization format", 401);
+      }
+      token = credentialMatch[1];
+    } else {
+      return this.errorResponse("Unauthorized", "Unsupported authorization type", 401);
+    }
+    
+    // Decode JWT to get computer name (without verification yet)
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return this.errorResponse("Unauthorized", "Invalid token format", 401);
+    }
+    
+    const payloadJson = JSON.parse(atob(parts[1]));
+    const computerName = payloadJson.sub;
+    
+    if (!computerName) {
+      return this.errorResponse("Unauthorized", "Invalid token claims", 401);
+    }
+    
+    // Get secrets (from cache or fetch)
+    let secrets = this.secretsCache.get(computerName);
+    let payload;
+    let needsFetch = false;
+    
+    // Try verification with cached secrets
+    if (secrets) {
+      try {
+        payload = await verifyToken(token, secrets);
+      } catch (err) {
+        // Cache invalid - need to fetch fresh secrets
+        needsFetch = true;
+      }
+    } else {
+      needsFetch = true;
+    }
+    
+    // Fetch secrets if not cached or verification failed
+    if (needsFetch) {
+      const computersStub = this.env.COMPUTERS.get(this.env.COMPUTERS.idFromName("global"));
+      const computer = await computersStub.getComputer(computerName);
+      
+      if (!computer) {
+        return this.errorResponse("Unauthorized", "Computer not found", 401);
+      }
+      
+      const fetchedSecrets: string[] = JSON.parse(computer.secrets);
+      if (fetchedSecrets.length === 0) {
+        return this.errorResponse("Unauthorized", "No secrets configured", 401);
+      }
+      
+      // Cache the secrets
+      this.secretsCache.set(computerName, fetchedSecrets);
+      
+      // Verify token with fresh secrets
+      try {
+        payload = await verifyToken(token, fetchedSecrets);
+      } catch (err) {
+        return this.errorResponse("Unauthorized", "Invalid token", 401);
+      }
+    }
+
+    if (!payload) {
+      return this.errorResponse("Unauthorized", "Token verification failed", 401);
+    }
+
+    // Verify token's bucket claim matches requested bucket
+    if (payload.bucket !== bucket) {
+      return this.errorResponse("Forbidden", "Token not valid for this bucket", 403);
+    }
     
     // Extract key while preserving trailing slashes
     // S3 treats "foo" and "foo/" as different keys (file vs directory marker)

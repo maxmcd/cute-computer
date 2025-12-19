@@ -11,8 +11,10 @@ import {
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
 } from "@aws-sdk/client-s3";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { DOMParser } from "@xmldom/xmldom";
+import { signToken } from "../lib/jwt";
+import type { Computer } from "../computers";
 
 // Polyfill DOMParser and Node constants for AWS SDK XML parsing
 globalThis.DOMParser = DOMParser as any;
@@ -24,24 +26,43 @@ globalThis.Node = {
   DOCUMENT_NODE: 9,
 } as any;
 
-function createS3Client(bucketName: string): S3Client {
-  const id = env.S3.idFromName(bucketName);
+// Store test computer credentials
+let testComputer: Computer;
+let testSecret: string;
+
+async function createS3ClientForBucket(doName: string): Promise<S3Client> {
+  // Token for accessing this S3 DO instance
+  // The bucket name in the token should match what's in the S3 path
+  const token = await signToken(
+    { sub: testComputer.slug, bucket: doName, expiresIn: 3600 },
+    testSecret
+  );
+
+  const id = env.S3.idFromName(doName);
   const stub = env.S3.get(id);
 
   return new S3Client({
     endpoint: "http://test",
     region: "auto",
     credentials: {
-      accessKeyId: "test",
-      secretAccessKey: "test",
+      // HACK: Pass JWT token as accessKeyId!
+      // The AWS SDK will include this in the Authorization header's Credential field
+      // Format: "AWS4-HMAC-SHA256 Credential=<jwt>/20231201/auto/s3/aws4_request, ..."
+      // Our S3 DO extracts the JWT from the Credential field
+      accessKeyId: token,
+      secretAccessKey: "not-used", // AWS SDK requires this but S3 DO ignores it
     },
     forcePathStyle: true, // Important: use path-style addressing (bucket in path)
     // Use stub.fetch as the request handler
     requestHandler: {
       handle: async (request: any) => {
-        const query = request.query ? `?${new URLSearchParams(request.query).toString()}` : '';
+        const query = request.query
+          ? `?${new URLSearchParams(request.query).toString()}`
+          : "";
         const url = `http://test${request.path}${query}`;
 
+        // AWS SDK has already added Authorization header with JWT in Credential field
+        // We just pass it through as-is - this tests the real AWS key hack!
         const fetchRequest = new Request(url, {
           method: request.method,
           headers: request.headers,
@@ -63,10 +84,25 @@ function createS3Client(bucketName: string): S3Client {
 }
 
 describe("S3 with AWS SDK", () => {
-  it("can PUT and GET an object using AWS S3 SDK", async () => {
-    const s3Client = createS3Client("test-instance");
+  beforeAll(async () => {
+    // Create a test computer with secrets
+    const computersStub = env.COMPUTERS.get(env.COMPUTERS.idFromName("global"));
+    const result = await computersStub.createComputer("Test Computer");
 
-    const bucket = "test-bucket";
+    if (!result.success || !result.computer) {
+      throw new Error(`Failed to create test computer: ${result.error}`);
+    }
+
+    testComputer = result.computer;
+    const secrets = JSON.parse(testComputer.secrets);
+    testSecret = secrets[0];
+  });
+
+  it("can PUT and GET an object using AWS S3 SDK", async () => {
+    const doName = "test-instance";
+    const s3Client = await createS3ClientForBucket(doName);
+
+    const bucket = doName; // Use DO name as bucket name for testing
     const key = "test-file.txt";
     const content = "Hello from AWS SDK!";
 
@@ -85,9 +121,10 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can PUT and GET an empty file", async () => {
-    const s3Client = createS3Client("test-instance");
+    const doName = "empty-test-bucket";
+    const s3Client = await createS3ClientForBucket(doName);
 
-    const bucket = "empty-test-bucket";
+    const bucket = doName;
     const key = "empty.txt";
 
     const putResult = await s3Client.send(
@@ -107,8 +144,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can HEAD an object", async () => {
-    const s3Client = createS3Client("head-test");
-    const bucket = "test-bucket";
+    const doName = "head-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "test.txt";
     const content = "test content";
 
@@ -126,8 +164,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can DELETE an object", async () => {
-    const s3Client = createS3Client("delete-test");
-    const bucket = "test-bucket";
+    const doName = "delete-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "delete-me.txt";
 
     await s3Client.send(
@@ -145,8 +184,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can list objects", async () => {
-    const s3Client = createS3Client("list-test");
-    const bucket = "test-bucket";
+    const doName = "list-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "file1.txt", Body: "data1" })
@@ -175,8 +215,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can list objects with prefix", async () => {
-    const s3Client = createS3Client("prefix-test");
-    const bucket = "prefix-bucket";
+    const doName = "prefix-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "foo/a.txt", Body: "a" })
@@ -200,8 +241,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can handle large files with chunking", async () => {
-    const s3Client = createS3Client("chunk-test");
-    const bucket = "test-bucket";
+    const doName = "chunk-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "large-file.bin";
 
     const size = 2 * 1024 * 1024;
@@ -226,8 +268,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can create and complete multipart upload", async () => {
-    const s3Client = createS3Client("multipart-test");
-    const bucket = "test-bucket";
+    const doName = "multipart-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "multipart-file.txt";
 
     const createResult = await s3Client.send(
@@ -280,8 +323,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can abort multipart upload", async () => {
-    const s3Client = createS3Client("abort-test");
-    const bucket = "test-bucket";
+    const doName = "abort-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "aborted-file.txt";
 
     const createResult = await s3Client.send(
@@ -314,12 +358,13 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("returns 404 for non-existent object", async () => {
-    const s3Client = createS3Client("not-found-test");
+    const doName = "not-found-test";
+    const s3Client = await createS3ClientForBucket(doName);
 
     await expect(
       s3Client.send(
         new GetObjectCommand({
-          Bucket: "test-bucket",
+          Bucket: doName,
           Key: "does-not-exist.txt",
         })
       )
@@ -327,8 +372,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("handles keys with special characters and URL encoding", async () => {
-    const s3Client = createS3Client("special-chars-test");
-    const bucket = "test-bucket";
+    const doName = "special-chars-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const key = "path/to/file with spaces & special-chars!.txt";
     const content = "special content";
 
@@ -358,8 +404,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("preserves trailing slashes in keys for directory markers", async () => {
-    const s3Client = createS3Client("trailing-slash-test");
-    const bucket = "test-bucket";
+    const doName = "trailing-slash-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "foo", Body: "file content" })
@@ -380,8 +427,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can GET directory markers with trailing slash", async () => {
-    const s3Client = createS3Client("dir-marker-test");
-    const bucket = "test-bucket";
+    const doName = "dir-marker-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "dir/", Body: "" })
@@ -401,8 +449,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("can DELETE directory markers with trailing slash", async () => {
-    const s3Client = createS3Client("delete-dir-test");
-    const bucket = "test-bucket";
+    const doName = "delete-dir-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "mydir/", Body: "" })
@@ -419,8 +468,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("treats foo and foo/ as distinct keys", async () => {
-    const s3Client = createS3Client("distinct-keys-test");
-    const bucket = "test-bucket";
+    const doName = "distinct-keys-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
     const fileContent = "this is a file";
     const dirContent = "";
 
@@ -456,8 +506,9 @@ describe("S3 with AWS SDK", () => {
   });
 
   it("lists directory structure with nested paths and trailing slashes", async () => {
-    const s3Client = createS3Client("nested-dir-test");
-    const bucket = "test-bucket";
+    const doName = "nested-dir-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
 
     await s3Client.send(
       new PutObjectCommand({ Bucket: bucket, Key: "a/", Body: "" })
@@ -466,10 +517,18 @@ describe("S3 with AWS SDK", () => {
       new PutObjectCommand({ Bucket: bucket, Key: "a/b/", Body: "" })
     );
     await s3Client.send(
-      new PutObjectCommand({ Bucket: bucket, Key: "a/b/file.txt", Body: "data" })
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: "a/b/file.txt",
+        Body: "data",
+      })
     );
     await s3Client.send(
-      new PutObjectCommand({ Bucket: bucket, Key: "a/file2.txt", Body: "data2" })
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: "a/file2.txt",
+        Body: "data2",
+      })
     );
 
     const listResult = await s3Client.send(

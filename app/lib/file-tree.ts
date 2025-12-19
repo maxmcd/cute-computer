@@ -144,3 +144,103 @@ export function detectLanguage(filename: string): string {
 
   return languageMap[ext] || "plaintext";
 }
+
+/**
+ * Move a file in the tree structure (optimistic update)
+ * Returns a new tree with the file moved
+ */
+export function moveFileInTree(
+  nodes: TreeNode[],
+  fromPath: string,
+  toFolderPath: string
+): TreeNode[] {
+  console.log("moveFileInTree called", { fromPath, toFolderPath });
+  
+  // Calculate the new path
+  const fileName = fromPath.split("/").pop();
+  if (!fileName) {
+    console.log("No fileName found in path");
+    return nodes;
+  }
+  
+  const newPath = toFolderPath ? `${toFolderPath}/${fileName}` : fileName;
+  console.log("Calculated newPath:", newPath);
+  
+  // If same location, no change
+  if (newPath === fromPath) {
+    console.log("Same location, no change");
+    return nodes;
+  }
+  
+  // Find and remove the node from its current location
+  let movedNode: TreeNode | null = null;
+  
+  function removeNode(nodes: TreeNode[], path: string): TreeNode[] {
+    const result: TreeNode[] = [];
+    
+    for (const node of nodes) {
+      if (node.id === path) {
+        // Found the node to remove - save it and don't include in result
+        movedNode = { ...node };
+        continue;
+      }
+      
+      // If this node has children, recursively check them
+      if (node.children) {
+        const updatedChildren = removeNode(node.children, path);
+        result.push({
+          ...node,
+          children: updatedChildren,
+        });
+      } else {
+        result.push(node);
+      }
+    }
+    
+    return result;
+  }
+  
+  // Insert the node at the new location
+  function insertNode(nodes: TreeNode[], folderPath: string, nodeToInsert: TreeNode): TreeNode[] {
+    // Update the node with new id and name (fileName is guaranteed to exist by early return above)
+    const updatedNode: TreeNode = {
+      ...nodeToInsert,
+      id: newPath,
+      name: fileName!, // Safe because we checked above
+    };
+    
+    // If inserting at root
+    if (!folderPath) {
+      return sortTreeNodes([...nodes, updatedNode]);
+    }
+    
+    return nodes.map(node => {
+      if (node.id === folderPath && node.isFolder) {
+        return {
+          ...node,
+          children: sortTreeNodes([...(node.children || []), updatedNode]),
+        };
+      }
+      if (node.children) {
+        return {
+          ...node,
+          children: insertNode(node.children, folderPath, nodeToInsert),
+        };
+      }
+      return node;
+    });
+  }
+  
+  // Perform the move
+  let newTree = removeNode(nodes, fromPath);
+  
+  if (movedNode) {
+    console.log("Node removed successfully");
+    newTree = insertNode(newTree, toFolderPath, movedNode);
+    console.log("Node inserted into target folder");
+  } else {
+    console.error("movedNode is null - node was not found in tree!");
+  }
+  
+  return newTree;
+}

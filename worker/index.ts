@@ -2,6 +2,7 @@ import { createRequestHandler } from "react-router";
 import { Container } from "@cloudflare/containers";
 import { S3 } from "./s3";
 import { Computers, type Computer } from "./computers";
+import { signToken } from "./lib/jwt";
 
 export { S3, Computers };
 
@@ -26,17 +27,32 @@ export class AppContainer extends Container<Env> {
   sleepAfter = "10m";
   // Environment variables passed to the container
   envVars = {
-    MESSAGE: "I was passed in via the container class!",
+    S3_AUTH_TOKEN: "", // Will be set from request header
   };
 
-  // override async onActivityExpired(): Promise<void> {
-  //   // Do nothing
-  //   return;
-  // }
+  // Override fetch to extract S3 token from header and set env vars
+  override async fetch(request: Request): Promise<Response> {
+    // Extract S3 auth token from header (set by the worker before routing here)
+    const s3Token = request.headers.get("X-S3-Auth-Token");
+    
+    if (s3Token) {
+      // Set the token in environment variables before container starts
+      this.envVars.S3_AUTH_TOKEN = s3Token;
+      
+      // Remove the internal header before passing to container
+      const cleanRequest = new Request(request.url, request);
+      cleanRequest.headers.delete("X-S3-Auth-Token");
+      
+      return super.fetch(cleanRequest);
+    }
+    
+    // No token provided, continue normally (shouldn't happen in production)
+    return super.fetch(request);
+  }
 
   // Optional lifecycle hooks
-  override onStart() {
-    console.log("Container successfully started");
+  override async onStart() {
+    console.log("Container started successfully");
   }
 
   override onStop() {
@@ -122,8 +138,29 @@ export default {
       if (!computer) {
         return createComputerNotFoundPage(subdomain);
       }
+      
+      // Generate JWT token for this computer
+      const secrets: string[] = JSON.parse(computer.secrets);
+      if (secrets.length === 0) {
+        return new Response("No secrets configured for computer", { status: 500 });
+      }
+      
+      const doId = env.APP_CONTAINER.idFromName(subdomain).toString();
+      const token = await signToken(
+        {
+          sub: subdomain,
+          bucket: `s3-${doId}`,
+          expiresIn: 86400, // 24 hours
+        },
+        secrets[0]
+      );
+      
+      // Add S3 auth token as header for container to use
+      const modifiedRequest = new Request(request.url, request);
+      modifiedRequest.headers.set("X-S3-Auth-Token", token);
+      
       const stub = env.APP_CONTAINER.getByName(subdomain);
-      return stub.fetch(request);
+      return stub.fetch(modifiedRequest);
     }
 
     if (url.pathname.startsWith("/s3-")) {
@@ -144,8 +181,28 @@ export default {
         return new Response("Computer not found", { status: 404 });
       }
 
+      // Generate JWT token for this computer
+      const secrets: string[] = JSON.parse(computer.secrets);
+      if (secrets.length === 0) {
+        return new Response("No secrets configured for computer", { status: 500 });
+      }
+      
+      const doId = env.APP_CONTAINER.idFromName(computerName).toString();
+      const token = await signToken(
+        {
+          sub: computerName,
+          bucket: `s3-${doId}`,
+          expiresIn: 86400, // 24 hours
+        },
+        secrets[0]
+      );
+      
+      // Add S3 auth token as header for container to use
+      const modifiedRequest = new Request(request.url, request);
+      modifiedRequest.headers.set("X-S3-Auth-Token", token);
+      
       // Route to container instance by computer name
-      return env.APP_CONTAINER.getByName(computerName).fetch(request);
+      return env.APP_CONTAINER.getByName(computerName).fetch(modifiedRequest);
     }
 
     return requestHandler(request, {
