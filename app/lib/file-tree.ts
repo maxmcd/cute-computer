@@ -25,11 +25,11 @@ export function buildFileTree(keys: string[]): TreeNode[] {
     // Handle directory markers (keys ending with /)
     const isDirectoryMarker = key.endsWith("/");
     const cleanKey = isDirectoryMarker ? key.slice(0, -1) : key;
-    
+
     // Split into parts, filtering out empty strings
-    const parts = cleanKey.split("/").filter(p => p.length > 0);
+    const parts = cleanKey.split("/").filter((p) => p.length > 0);
     if (parts.length === 0) return; // Skip empty keys
-    
+
     let currentNode = root;
 
     parts.forEach((part, index) => {
@@ -37,7 +37,9 @@ export function buildFileTree(keys: string[]): TreeNode[] {
       const pathSoFar = parts.slice(0, index + 1).join("/");
 
       // Check if this node already exists in children
-      let existingNode = currentNode.children?.find((child) => child.name === part);
+      let existingNode = currentNode.children?.find(
+        (child) => child.name === part
+      );
 
       if (!existingNode) {
         // Create new node
@@ -78,17 +80,19 @@ export function buildFileTree(keys: string[]): TreeNode[] {
  * Sort tree nodes: folders first, then files, alphabetically within each group
  */
 export function sortTreeNodes(nodes: TreeNode[]): TreeNode[] {
-  return nodes.sort((a, b) => {
-    // Folders before files
-    if (a.isFolder && !b.isFolder) return -1;
-    if (!a.isFolder && b.isFolder) return 1;
-    
-    // Alphabetically
-    return a.name.localeCompare(b.name);
-  }).map(node => ({
-    ...node,
-    children: node.children ? sortTreeNodes(node.children) : undefined,
-  }));
+  return nodes
+    .sort((a, b) => {
+      // Folders before files
+      if (a.isFolder && !b.isFolder) return -1;
+      if (!a.isFolder && b.isFolder) return 1;
+
+      // Alphabetically
+      return a.name.localeCompare(b.name);
+    })
+    .map((node) => ({
+      ...node,
+      children: node.children ? sortTreeNodes(node.children) : undefined,
+    }));
 }
 
 /**
@@ -105,12 +109,12 @@ export function getFileExtension(filename: string): string {
  */
 export function detectLanguage(filename: string): string {
   const ext = getFileExtension(filename);
-  
+
   const languageMap: Record<string, string> = {
     js: "javascript",
-    jsx: "javascript",  // Monaco handles JSX within javascript/typescript
+    jsx: "javascript", // Monaco handles JSX within javascript/typescript
     ts: "typescript",
-    tsx: "typescript",  // Monaco handles TSX within typescript
+    tsx: "typescript", // Monaco handles TSX within typescript
     py: "python",
     go: "go",
     rs: "rust",
@@ -135,11 +139,11 @@ export function detectLanguage(filename: string): string {
     toml: "toml",
     md: "markdown",
     markdown: "markdown",
-    sh: "shell",  // Monaco uses "shell" instead of "bash"
+    sh: "shell", // Monaco uses "shell" instead of "bash"
     bash: "shell",
     zsh: "shell",
     sql: "sql",
-    txt: "plaintext",  // Monaco uses "plaintext" instead of "text"
+    txt: "plaintext", // Monaco uses "plaintext" instead of "text"
   };
 
   return languageMap[ext] || "plaintext";
@@ -154,37 +158,32 @@ export function moveFileInTree(
   fromPath: string,
   toFolderPath: string
 ): TreeNode[] {
-  console.log("moveFileInTree called", { fromPath, toFolderPath });
-  
   // Calculate the new path
   const fileName = fromPath.split("/").pop();
   if (!fileName) {
-    console.log("No fileName found in path");
     return nodes;
   }
-  
+
   const newPath = toFolderPath ? `${toFolderPath}/${fileName}` : fileName;
-  console.log("Calculated newPath:", newPath);
-  
+
   // If same location, no change
   if (newPath === fromPath) {
-    console.log("Same location, no change");
     return nodes;
   }
-  
+
   // Find and remove the node from its current location
   let movedNode: TreeNode | null = null;
-  
+
   function removeNode(nodes: TreeNode[], path: string): TreeNode[] {
     const result: TreeNode[] = [];
-    
+
     for (const node of nodes) {
       if (node.id === path) {
         // Found the node to remove - save it and don't include in result
         movedNode = { ...node };
         continue;
       }
-      
+
       // If this node has children, recursively check them
       if (node.children) {
         const updatedChildren = removeNode(node.children, path);
@@ -196,25 +195,29 @@ export function moveFileInTree(
         result.push(node);
       }
     }
-    
+
     return result;
   }
-  
+
   // Insert the node at the new location
-  function insertNode(nodes: TreeNode[], folderPath: string, nodeToInsert: TreeNode): TreeNode[] {
+  function insertNode(
+    nodes: TreeNode[],
+    folderPath: string,
+    nodeToInsert: TreeNode
+  ): TreeNode[] {
     // Update the node with new id and name (fileName is guaranteed to exist by early return above)
     const updatedNode: TreeNode = {
       ...nodeToInsert,
       id: newPath,
       name: fileName!, // Safe because we checked above
     };
-    
+
     // If inserting at root
     if (!folderPath) {
       return sortTreeNodes([...nodes, updatedNode]);
     }
-    
-    return nodes.map(node => {
+
+    return nodes.map((node) => {
       if (node.id === folderPath && node.isFolder) {
         return {
           ...node,
@@ -230,17 +233,13 @@ export function moveFileInTree(
       return node;
     });
   }
-  
+
   // Perform the move
   let newTree = removeNode(nodes, fromPath);
-  
+
   if (movedNode) {
-    console.log("Node removed successfully");
     newTree = insertNode(newTree, toFolderPath, movedNode);
-    console.log("Node inserted into target folder");
-  } else {
-    console.error("movedNode is null - node was not found in tree!");
   }
-  
+
   return newTree;
 }

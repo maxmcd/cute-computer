@@ -91,7 +91,7 @@ export function FileTree({
             openByDefault={false}
             initialOpenState={openState}
             width="100%"
-            height={300}
+            height={treeHeight}
             indent={16}
             rowHeight={28}
             overscanCount={10}
@@ -116,21 +116,6 @@ export function FileTree({
             }}
             onMove={(args) => {
               if (!onMoveFile) return;
-
-              console.log("onMove called", {
-                dragNodes: args.dragNodes.map((n) => ({
-                  id: n.data.id,
-                  name: n.data.name,
-                })),
-                parentNode: args.parentNode
-                  ? {
-                      id: args.parentNode.data.id,
-                      name: args.parentNode.data.name,
-                    }
-                  : null,
-                index: args.index,
-              });
-
               const draggedNode = args.dragNodes[0];
               const parentNode = args.parentNode;
 

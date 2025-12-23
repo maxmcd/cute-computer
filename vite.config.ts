@@ -12,6 +12,6 @@ export default defineConfig({
     tsconfigPaths(),
   ],
   server: {
-    allowedHosts: ["host.lima.internal"],
+    allowedHosts: ["host.lima.internal", "host.docker.internal"],
   },
 });

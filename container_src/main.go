@@ -7,6 +7,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -50,6 +51,20 @@ type resizeMessage struct {
 	Rows uint16 `json:"rows"`
 }
 
+// FileInfo represents file metadata for API responses
+type FileInfo struct {
+	Path  string `json:"path"`  // Relative to /home/cutie
+	Name  string `json:"name"`  // Basename of file
+	IsDir bool   `json:"isDir"` // True if directory
+	Size  int64  `json:"size"`  // File size in bytes
+}
+
+// MoveRequest represents a file move/rename operation
+type MoveRequest struct {
+	From string `json:"from"` // Source path (relative to /home/cutie)
+	To   string `json:"to"`   // Destination path (relative to /home/cutie)
+}
+
 // Config represents the user's configuration file
 type Config struct {
 	Static string `json:"static"`
@@ -87,6 +102,96 @@ func waitForMount(path string, timeout time.Duration) error {
 		}
 	}
 	return fmt.Errorf("ticker closed unexpectedly")
+}
+
+// validateAndResolvePath validates a relative path and converts it to absolute
+// Returns absolute path within /home/cutie or error if invalid
+func validateAndResolvePath(relativePath string) (string, error) {
+	// Clean the path to remove .. and .
+	cleanPath := filepath.Clean(relativePath)
+
+	// Remove leading slash if present
+	cleanPath = strings.TrimPrefix(cleanPath, "/")
+
+	// Build absolute path
+	absPath := filepath.Join("/home/cutie", cleanPath)
+
+	// Security check: ensure path is within /home/cutie
+	if !strings.HasPrefix(absPath, "/home/cutie/") && absPath != "/home/cutie" {
+		return "", fmt.Errorf("invalid path: must be within /home/cutie")
+	}
+
+	return absPath, nil
+}
+
+// toRelativePath converts absolute path to relative (strips /home/cutie prefix)
+func toRelativePath(absPath string) string {
+	// Remove /home/cutie/ prefix
+	rel := strings.TrimPrefix(absPath, "/home/cutie/")
+	// Also handle exact match for /home/cutie (root)
+	if rel == absPath {
+		rel = strings.TrimPrefix(absPath, "/home/cutie")
+	}
+	// Remove leading slash
+	rel = strings.TrimPrefix(rel, "/")
+	return rel
+}
+
+// writeLog sends a log entry to the Logs Durable Object
+func writeLog(logMessage string) {
+	// Get logs endpoint from environment (set by container runtime)
+	logsEndpoint := os.Getenv("LOGS_ENDPOINT")
+	logsToken := os.Getenv("LOGS_TOKEN")
+
+	// Replace entire host with host.docker.internal if URL contains localhost
+	if strings.Contains(logsEndpoint, "localhost") {
+		if parsedURL, err := url.Parse(logsEndpoint); err == nil {
+			parsedURL.Host = strings.Replace(parsedURL.Host, parsedURL.Hostname(), "host.docker.internal", 1)
+			logsEndpoint = parsedURL.String()
+		}
+	}
+
+	if logsEndpoint == "" || logsToken == "" {
+		// Silently skip if not configured
+		return
+	}
+
+	// Create log entry with nanosecond timestamp
+	ts := fmt.Sprintf("%d", time.Now().UnixNano())
+	logEntry := map[string]interface{}{
+		"ts":  ts,
+		"log": logMessage,
+	}
+
+	logs := []map[string]interface{}{logEntry}
+	jsonData, err := json.Marshal(logs)
+	if err != nil {
+		log.Printf("Failed to marshal log: %v", err)
+		return
+	}
+
+	// Send to logs endpoint
+	req, err := http.NewRequest("POST", logsEndpoint+"/write", strings.NewReader(string(jsonData)))
+	if err != nil {
+		log.Printf("Failed to create log request: %v", err)
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+logsToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to send log: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Log write failed: %d - %s", resp.StatusCode, string(body))
+	}
 }
 
 // ensureConfigExists creates a default config file if none exists
@@ -368,11 +473,296 @@ func serve404(w http.ResponseWriter, path string) {
 	w.Write([]byte(html))
 }
 
+// handleAPIFilesList lists files in a directory
+func handleAPIFilesList(w http.ResponseWriter, r *http.Request) {
+	// Get path from query parameter (default to root)
+	queryPath := r.URL.Query().Get("path")
+	if queryPath == "" {
+		queryPath = ""
+	}
+
+	// Validate and resolve path
+	absPath, err := validateAndResolvePath(queryPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Check if directory exists
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Directory not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !info.IsDir() {
+		http.Error(w, "Path is not a directory", http.StatusBadRequest)
+		return
+	}
+
+	// Walk directory tree recursively
+	var files []FileInfo
+	err = filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip the root directory itself
+		if path == absPath {
+			return nil
+		}
+
+		relPath := toRelativePath(path)
+		files = append(files, FileInfo{
+			Path:  relPath,
+			Name:  info.Name(),
+			IsDir: info.IsDir(),
+			Size:  info.Size(),
+		})
+
+		return nil
+	})
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(files)
+}
+
+// handleAPIFilesGet reads a file's content
+func handleAPIFilesGet(w http.ResponseWriter, r *http.Request, filePath string) {
+	// Validate and resolve path
+	absPath, err := validateAndResolvePath(filePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Check if file exists
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Don't serve directories as file content
+	if info.IsDir() {
+		http.Error(w, "Path is a directory", http.StatusBadRequest)
+		return
+	}
+
+	// Read file content
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Detect MIME type
+	mimeType := mime.TypeByExtension(filepath.Ext(absPath))
+	if mimeType == "" {
+		mimeType = "text/plain"
+	}
+
+	// Return file content
+	w.Header().Set("Content-Type", mimeType)
+	w.Write(content)
+}
+
+// handleAPIFilesPut creates or updates a file
+func handleAPIFilesPut(w http.ResponseWriter, r *http.Request, filePath string) {
+	// Validate and resolve path
+	absPath, err := validateAndResolvePath(filePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Read request body
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// Create parent directories if needed
+	parentDir := filepath.Dir(absPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create parent directories: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Write file
+	if err := os.WriteFile(absPath, content, 0644); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to write file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleAPIFilesDelete deletes a file
+func handleAPIFilesDelete(w http.ResponseWriter, r *http.Request, filePath string) {
+	// Validate and resolve path
+	absPath, err := validateAndResolvePath(filePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Delete file
+	if err := os.Remove(absPath); err != nil {
+		if os.IsNotExist(err) {
+			// 404 is acceptable for delete
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Failed to delete file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAPIFilesMove moves or renames a file
+func handleAPIFilesMove(w http.ResponseWriter, r *http.Request) {
+	// Parse JSON request body
+	var req MoveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON request", http.StatusBadRequest)
+		return
+	}
+
+	// Validate paths
+	fromPath, err := validateAndResolvePath(req.From)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid source path: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	toPath, err := validateAndResolvePath(req.To)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid destination path: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Check source exists
+	if _, err := os.Stat(fromPath); err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "Source file not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create parent directory of destination if needed
+	toParent := filepath.Dir(toPath)
+	if err := os.MkdirAll(toParent, 0755); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create destination directory: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Move/rename file
+	if err := os.Rename(fromPath, toPath); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to move file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	written    int64
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	n, err := rw.ResponseWriter.Write(b)
+	rw.written += int64(n)
+	return n, err
+}
+
+// formatBytes converts bytes to human-readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// formatDuration converts duration to human-readable format
+func formatDuration(d time.Duration) string {
+	if d < time.Microsecond {
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.2fµs", float64(d.Nanoseconds())/1000.0)
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000.0)
+	}
+	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+// logRequest logs HTTP request with beautiful formatting
+func logRequest(method, path string, status int, duration time.Duration, size int64) {
+	statusText := http.StatusText(status)
+	durationStr := formatDuration(duration)
+	sizeStr := formatBytes(size)
+
+	// Format: GET /index.html -> 200 OK (2.45ms, 1.2 KB)
+	logMsg := fmt.Sprintf("%s %s -> %d %s (%s, %s)",
+		method, path, status, statusText, durationStr, sizeStr)
+
+	writeLog(logMsg)
+}
+
 // handleHTTP serves static files based on config
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Track request timing
+	startTime := time.Now()
+
+	// Wrap response writer to capture status and size
+	rw := &responseWriter{
+		ResponseWriter: w,
+		statusCode:     200, // Default to 200
+		written:        0,
+	}
+
+	// Defer logging until after response is sent
+	defer func() {
+		duration := time.Since(startTime)
+		logRequest(r.Method, r.URL.Path, rw.statusCode, duration, rw.written)
+	}()
 	// Only serve GET and HEAD requests
 	if r.Method != "GET" && r.Method != "HEAD" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -380,7 +770,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	config, err := loadConfig()
 	if err != nil {
 		details := fmt.Sprintf(`<div class="details">%s</div>`, err.Error())
-		serveErrorPage(w, "Configuration Error",
+		serveErrorPage(rw, "Configuration Error",
 			"There was a problem loading your config file. Please check the syntax and try again.",
 			details)
 		return
@@ -392,7 +782,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		details := fmt.Sprintf(`<div class="details">%s
 
 Configured path: %s</div>`, err.Error(), config.Static)
-		serveErrorPage(w, "Static Directory Error",
+		serveErrorPage(rw, "Static Directory Error",
 			"The configured static directory could not be found or accessed.",
 			details)
 		return
@@ -412,7 +802,7 @@ Configured path: %s</div>`, err.Error(), config.Static)
 
 	// Security: ensure the resolved path is still within staticDir
 	if !strings.HasPrefix(fullPath, staticDir) {
-		serve404(w, r.URL.Path)
+		serve404(rw, r.URL.Path)
 		return
 	}
 
@@ -420,10 +810,10 @@ Configured path: %s</div>`, err.Error(), config.Static)
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			serve404(w, r.URL.Path)
+			serve404(rw, r.URL.Path)
 			return
 		}
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(rw, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -433,7 +823,7 @@ Configured path: %s</div>`, err.Error(), config.Static)
 		if _, err := os.Stat(indexPath); err == nil {
 			fullPath = indexPath
 		} else {
-			serve404(w, r.URL.Path)
+			serve404(rw, r.URL.Path)
 			return
 		}
 	}
@@ -441,7 +831,7 @@ Configured path: %s</div>`, err.Error(), config.Static)
 	// Read file
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		http.Error(rw, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -452,11 +842,11 @@ Configured path: %s</div>`, err.Error(), config.Static)
 	}
 
 	// Set headers
-	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	rw.Header().Set("Content-Type", mimeType)
+	rw.Header().Set("Content-Length", strconv.Itoa(len(content)))
 
 	// Write content
-	w.Write(content)
+	rw.Write(content)
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -727,6 +1117,34 @@ func main() {
 	// WebSocket endpoint for PTY
 	http.HandleFunc("/ws", handleWebSocket)
 
+	// File API endpoints
+	http.HandleFunc("/api/files", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			handleAPIFilesList(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/api/files/", func(w http.ResponseWriter, r *http.Request) {
+		// Extract file path from URL
+		filePath := strings.TrimPrefix(r.URL.Path, "/api/files/")
+
+		switch r.Method {
+		case "GET":
+			handleAPIFilesGet(w, r, filePath)
+		case "PUT":
+			handleAPIFilesPut(w, r, filePath)
+		case "DELETE":
+			handleAPIFilesDelete(w, r, filePath)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/api/files/move", handleAPIFilesMove)
+
 	// All other requests go to static file handler
 	http.HandleFunc("/", handleHTTP)
 
@@ -742,6 +1160,9 @@ func main() {
 	port := 8283
 
 	fmt.Printf("Server running at http://0.0.0.0:%d\n", port)
+
+	writeLog("Container started successfully")
+	writeLog(fmt.Sprintf("Server listening on port %d", port))
 
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
 		log.Fatalf("Server failed: %v", err)

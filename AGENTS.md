@@ -36,13 +36,18 @@ This document provides context for AI coding agents working on the Cute Computer
 ┌─────────────▼───────────────────────┐
 │   Cloudflare Worker                 │
 │   - Request routing                 │
-│   - JWT authentication              │
+│   - Proxy to container              │
 └─────────────┬───────────────────────┘
               │
 ┌─────────────▼───────────────────────┐
-│   Durable Objects (DO)              │
-│   - S3 DO: File storage             │
-│   - Computer DO: Container runtime  │
+│   Container (Durable Object)        │
+│   - File API (Go HTTP server)       │
+│   - Terminal (WebSocket PTY)        │
+│   - FUSE mount to S3 DO             │
+└─────────────┬───────────────────────┘
+              │
+┌─────────────▼───────────────────────┐
+│   S3 DO: Persistent storage         │
 └─────────────────────────────────────┘
 ```
 
@@ -67,7 +72,87 @@ cute-computer/
 
 ## Critical Implementation Patterns
 
-### 1. JWT Authentication ("The AWS Key Hack")
+### 1. Container File API
+
+**Context**: File operations go through the container's HTTP API rather than directly to S3.
+
+**Implementation**:
+```typescript
+// Frontend uses container API
+import { listContainerFiles, getContainerFile, putContainerFile } from "../lib/container"
+
+// List all files
+const files = await listContainerFiles(computerName)
+
+// Read file
+const content = await getContainerFile(computerName, "src/main.go")
+
+// Write file
+await putContainerFile(computerName, "src/main.go", content)
+
+// Move file
+await moveContainerFile(computerName, "old.go", "new.go")
+```
+
+**API Routes**:
+- `GET /api/files` - List all files recursively
+- `GET /api/files/:path` - Read file content
+- `PUT /api/files/:path` - Create/update file
+- `DELETE /api/files/:path` - Delete file
+- `POST /api/files/move` - Move/rename file
+
+**Worker Proxy**:
+```typescript
+// Frontend requests go through worker proxy
+GET /api/computer/:name/files → Container GET /api/files
+GET /api/computer/:name/files/src/main.go → Container GET /api/files/src/main.go
+```
+
+**Benefits**:
+- Single source of truth (container filesystem)
+- Simpler mental model (files where they run)
+- Opens door for LSP, file watching, build tools
+- No JWT complexity for file operations
+
+**Files**:
+- `app/lib/container.ts` - Frontend API client
+- `container_src/main.go` - Container HTTP handlers
+- `app/routes/api/computer.$name.files.$.ts` - Worker proxy
+
+### 2. Path Format and Security
+
+**Critical**: All file paths are relative to `/home/cutie` and must be validated.
+
+**Path Format**:
+```
+Absolute (in container): /home/cutie/src/main.go
+Relative (in API):       src/main.go
+
+Absolute (in container): /home/cutie/config.json
+Relative (in API):       config.json
+```
+
+**Security**:
+```go
+// main.go validates all paths
+func validateAndResolvePath(relativePath string) (string, error) {
+    cleanPath := filepath.Clean(relativePath)
+    cleanPath = strings.TrimPrefix(cleanPath, "/")
+    absPath := filepath.Join("/home/cutie", cleanPath)
+    
+    // Ensure path is within /home/cutie
+    if !strings.HasPrefix(absPath, "/home/cutie/") && absPath != "/home/cutie" {
+        return "", fmt.Errorf("invalid path")
+    }
+    
+    return absPath, nil
+}
+```
+
+**Files**:
+- `container_src/main.go` - Path validation functions
+
+### 3. JWT Authentication ("The AWS Key Hack")
 
 **Context**: Cloudflare's S3-compatible API doesn't natively support custom auth, so we repurpose the AWS credential fields.
 

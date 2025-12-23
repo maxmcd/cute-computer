@@ -6,13 +6,12 @@ import { CodeEditor } from "../components/CodeEditor";
 import { Window } from "../components/Window";
 import { ViewContainer } from "../components/ViewContainer";
 import {
-  fetchDurableObjectId,
-  fetchComputerDetails,
-  listS3Objects,
-  getS3Object,
-  putS3Object,
-  deleteS3Object,
-} from "../lib/s3";
+  listContainerFiles,
+  getContainerFile,
+  putContainerFile,
+  deleteContainerFile,
+  moveContainerFile,
+} from "../lib/container";
 import {
   buildFileTree,
   sortTreeNodes,
@@ -40,14 +39,14 @@ export async function loader({ params, context, request }: LoaderFunctionArgs) {
 
   // Extract host from request
   const url = new URL(request.url);
-  const host = url.host;
-
-  return {
+  const result = {
     computerName: computer.name,
     computerSlug: computer.slug,
     createdAt: computer.created_at,
-    host: host,
+    host: url.host,
+    scheme: url.origin.slice(0, url.origin.length - url.host.length),
   };
+  return result;
 }
 
 export function meta({ data }: any) {
@@ -79,12 +78,14 @@ export default function Computer() {
   const [reconnectMessage, setReconnectMessage] = useState("");
 
   // Computer display name from loader
-  const computerDisplayName = loaderData.computerName;
-  const createdAt = loaderData.createdAt;
-  const host = loaderData.host;
+  const {
+    computerName: computerDisplayName,
+    createdAt,
+    host,
+    scheme,
+  } = loaderData;
 
   // Editor state
-  const [doId, setDoId] = useState<string>("");
   const [fileTree, setFileTree] = useState<TreeNode[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState<string>("");
@@ -98,8 +99,9 @@ export default function Computer() {
     {}
   );
   const fileCacheRef = useRef<Map<string, string>>(new Map());
+  const fileSizesRef = useRef<Map<string, number>>(new Map());
 
-  const subdomainUrl = `http://${computerName}.${host}`;
+  const subdomainUrl = `${scheme}${computerName}.${host}`;
   // Initialize terminal (only when terminal view is active)
   useEffect(() => {
     if (view !== "terminal") return;
@@ -230,11 +232,20 @@ export default function Computer() {
         setLoadingFiles(true);
         setEditorError("");
 
-        const details = await fetchComputerDetails(computerName);
-        setDoId(details.doId);
+        const files = await listContainerFiles(computerName);
 
-        const objects = await listS3Objects(computerName, details.doId, "");
-        const keys = objects.map((obj) => obj.key);
+        // Store file sizes for later checking
+        fileSizesRef.current.clear();
+        files.forEach((file) => {
+          if (!file.isDir) {
+            fileSizesRef.current.set(file.path, file.size);
+          }
+        });
+
+        // Convert to keys, adding trailing slash for directories
+        const keys = files.map((file) =>
+          file.isDir ? `${file.path}/` : file.path
+        );
         const tree = buildFileTree(keys);
         const sortedTree = sortTreeNodes(tree);
         setFileTree(sortedTree);
@@ -258,12 +269,12 @@ export default function Computer() {
 
   // Auto-save
   useEffect(() => {
-    if (!selectedFile || !doId || !isDirty) return;
+    if (!selectedFile || !isDirty) return;
 
     const autoSaveTimer = setTimeout(async () => {
       try {
         setIsSaving(true);
-        await putS3Object(computerName, doId, selectedFile, fileContent);
+        await putContainerFile(computerName, selectedFile, fileContent);
         setOriginalContent(fileContent);
         setIsDirty(false);
         fileCacheRef.current.set(selectedFile, fileContent);
@@ -275,14 +286,12 @@ export default function Computer() {
     }, 500);
 
     return () => clearTimeout(autoSaveTimer);
-  }, [fileContent, selectedFile, doId, isDirty]);
+  }, [fileContent, selectedFile, isDirty, computerName]);
 
   const handleFileSelect = async (filePath: string) => {
-    if (!doId) return;
-
-    if (isDirty && selectedFile && doId) {
+    if (isDirty && selectedFile) {
       try {
-        await putS3Object(computerName, doId, selectedFile, fileContent);
+        await putContainerFile(computerName, selectedFile, fileContent);
         setOriginalContent(fileContent);
         setIsDirty(false);
         fileCacheRef.current.set(selectedFile, fileContent);
@@ -293,6 +302,22 @@ export default function Computer() {
 
     try {
       setEditorError("");
+
+      // Check file size before loading
+      const maxFileSize = 1024 * 1024; // 1MB
+      const fileSize = fileSizesRef.current.get(filePath);
+      if (fileSize !== undefined && fileSize > maxFileSize) {
+        const sizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+        setEditorError(
+          `Cannot open file: ${filePath.split("/").pop()} is ${sizeMB}MB (max 1MB)`
+        );
+        setSelectedFile(null);
+        setFileContent("");
+        setOriginalContent("");
+        setIsDirty(false);
+        return;
+      }
+
       const cached = fileCacheRef.current.get(filePath);
       if (cached !== undefined) {
         setFileContent(cached);
@@ -301,7 +326,7 @@ export default function Computer() {
         setLoadingFileContent(false);
       } else {
         setLoadingFileContent(true);
-        const content = await getS3Object(computerName, doId, filePath);
+        const content = await getContainerFile(computerName, filePath);
 
         if (fileCacheRef.current.size >= 10) {
           const firstKey = fileCacheRef.current.keys().next().value;
@@ -329,12 +354,22 @@ export default function Computer() {
   };
 
   const refreshFileTree = async () => {
-    if (!doId) return;
-
     try {
       setLoadingFiles(true);
-      const objects = await listS3Objects(computerName, doId, "");
-      const keys = objects.map((obj) => obj.key);
+      const files = await listContainerFiles(computerName);
+
+      // Store file sizes for later checking
+      fileSizesRef.current.clear();
+      files.forEach((file) => {
+        if (!file.isDir) {
+          fileSizesRef.current.set(file.path, file.size);
+        }
+      });
+
+      // Convert to keys, adding trailing slash for directories
+      const keys = files.map((file) =>
+        file.isDir ? `${file.path}/` : file.path
+      );
       const tree = buildFileTree(keys);
       const sortedTree = sortTreeNodes(tree);
       setFileTree(sortedTree);
@@ -349,8 +384,6 @@ export default function Computer() {
   };
 
   const handleCreateFile = async () => {
-    if (!doId) return;
-
     const fileName = window.prompt("Enter file name (e.g., script.js):");
     if (!fileName) return;
 
@@ -358,7 +391,7 @@ export default function Computer() {
 
     try {
       setEditorError("");
-      await putS3Object(computerName, doId, cleanFileName, "");
+      await putContainerFile(computerName, cleanFileName, "");
       await refreshFileTree();
       // Clear content and select new file
       setFileContent("");
@@ -374,8 +407,6 @@ export default function Computer() {
   };
 
   const handleCreateFolder = async () => {
-    if (!doId) return;
-
     const folderName = window.prompt("Enter folder name (e.g., src):");
     if (!folderName) return;
 
@@ -384,7 +415,7 @@ export default function Computer() {
 
     try {
       setEditorError("");
-      await putS3Object(computerName, doId, folderPath, "");
+      await putContainerFile(computerName, folderPath, "");
       await refreshFileTree();
     } catch (error) {
       console.error("Failed to create folder:", error);
@@ -395,7 +426,7 @@ export default function Computer() {
   };
 
   const handleDeleteFile = async () => {
-    if (!selectedFile || !doId) return;
+    if (!selectedFile) return;
 
     const confirmed = window.confirm(
       `Are you sure you want to delete "${selectedFile}"?`
@@ -404,7 +435,7 @@ export default function Computer() {
 
     try {
       setEditorError("");
-      await deleteS3Object(computerName, doId, selectedFile);
+      await deleteContainerFile(computerName, selectedFile);
 
       // Clear selection and refresh tree
       fileCacheRef.current.delete(selectedFile);
@@ -422,7 +453,7 @@ export default function Computer() {
   };
 
   const handleRenameFile = async () => {
-    if (!selectedFile || !doId) return;
+    if (!selectedFile) return;
 
     const newName = window.prompt("Enter new file name:", selectedFile);
     if (!newName || newName === selectedFile) return;
@@ -432,11 +463,8 @@ export default function Computer() {
     try {
       setEditorError("");
 
-      // Create new file with same content
-      await putS3Object(computerName, doId, cleanNewName, fileContent);
-
-      // Delete old file
-      await deleteS3Object(computerName, doId, selectedFile);
+      // Move file to new name
+      await moveContainerFile(computerName, selectedFile, cleanNewName);
 
       // Update cache
       fileCacheRef.current.delete(selectedFile);
@@ -456,7 +484,6 @@ export default function Computer() {
   };
 
   const handleMoveFile = async (fromPath: string, toFolder: string) => {
-    if (!doId) return;
     try {
       setEditorError("");
 
@@ -469,7 +496,6 @@ export default function Computer() {
 
       // Don't move if it's the same location
       if (newPath === fromPath) {
-        console.log("Same location, skipping");
         return;
       }
 
@@ -482,24 +508,21 @@ export default function Computer() {
         setSelectedFile(newPath);
       }
 
-      // Now perform server operations in background
-      const content = await getS3Object(computerName, doId, fromPath);
-
-      await putS3Object(computerName, doId, newPath, content);
-
-      await deleteS3Object(computerName, doId, fromPath);
+      // Now perform server operation
+      await moveContainerFile(computerName, fromPath, newPath);
 
       // Update cache
-      fileCacheRef.current.delete(fromPath);
-      fileCacheRef.current.set(newPath, content);
+      const content = fileCacheRef.current.get(fromPath);
+      if (content !== undefined) {
+        fileCacheRef.current.delete(fromPath);
+        fileCacheRef.current.set(newPath, content);
+      }
 
       // Update file content if this was the selected file
-      if (selectedFile === fromPath) {
+      if (selectedFile === fromPath && content !== undefined) {
         setFileContent(content);
         setOriginalContent(content);
       }
-
-      console.log("Move complete");
     } catch (error) {
       console.error("Failed to move file:", error);
       setEditorError(
@@ -797,11 +820,7 @@ export default function Computer() {
   if (view === "logs") {
     return (
       <ViewContainer computerName={computerName}>
-        <Window title="Logs" onClose={handleCloseView}>
-          <div className="h-[600px] p-4 bg-white overflow-auto font-mono text-sm">
-            <p className="text-gray-600">Container logs will appear here...</p>
-          </div>
-        </Window>
+        <LogsView computerName={computerName} onClose={handleCloseView} />
       </ViewContainer>
     );
   }
@@ -810,10 +829,7 @@ export default function Computer() {
   if (view === "preview") {
     return (
       <ViewContainer computerName={computerName}>
-        <Window
-          title={`Preview - ${subdomainUrl.replace("http://", "")}`}
-          onClose={handleCloseView}
-        >
+        <Window title={`Preview - ${subdomainUrl}`} onClose={handleCloseView}>
           {subdomainUrl && (
             <iframe
               src={subdomainUrl}
@@ -827,4 +843,145 @@ export default function Computer() {
   }
 
   return null;
+}
+
+// Logs View Component
+function LogsView({
+  computerName,
+  onClose,
+}: {
+  computerName: string;
+  onClose: () => void;
+}) {
+  const [logs, setLogs] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>("");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [debouncedSearch, setDebouncedSearch] = useState<string>("");
+
+  // Debounce search query
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchQuery);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    async function fetchLogs() {
+      try {
+        setLoading(true);
+        setError("");
+        const params = new URLSearchParams({ limit: "100" });
+        if (debouncedSearch) {
+          params.set("search", debouncedSearch);
+        }
+        const response = await fetch(
+          `/api/computer/${computerName}/logs?${params}`
+        );
+        if (!response.ok) {
+          throw new Error(`Failed to fetch logs: ${response.statusText}`);
+        }
+        const data = (await response.json()) as any[];
+        setLogs(data);
+      } catch (err) {
+        console.error("Failed to load logs:", err);
+        setError(err instanceof Error ? err.message : "Failed to load logs");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchLogs();
+
+    // Auto-refresh every 5 seconds with current search
+    const interval = setInterval(fetchLogs, 5000);
+    return () => clearInterval(interval);
+  }, [computerName, debouncedSearch]);
+
+  const formatTimestamp = (tsSec: number, tsNsec: number) => {
+    const date = new Date(tsSec * 1000);
+    const ms = Math.floor(tsNsec / 1_000_000);
+    // Use 24-hour format with leading zeros
+    const hours = date.getHours().toString().padStart(2, "0");
+    const minutes = date.getMinutes().toString().padStart(2, "0");
+    const seconds = date.getSeconds().toString().padStart(2, "0");
+    return `${hours}:${minutes}:${seconds}.${ms.toString().padStart(3, "0")}`;
+  };
+
+  // Render log with highlighting
+  const renderLogWithHighlight = (highlightedLog: string) => {
+    // Split by <mark> tags and render with highlighting
+    const parts = highlightedLog.split(/(<mark>.*?<\/mark>)/g);
+    return (
+      <>
+        {parts.map((part, i) => {
+          if (part.startsWith("<mark>") && part.endsWith("</mark>")) {
+            const text = part.slice(6, -7); // Remove <mark> and </mark>
+            return (
+              <mark key={i} className="bg-yellow-200 px-0.5">
+                {text}
+              </mark>
+            );
+          }
+          return <span key={i}>{part}</span>;
+        })}
+      </>
+    );
+  };
+
+  return (
+    <Window title="Logs" onClose={onClose}>
+      <div className="h-[600px] flex flex-col bg-white">
+        {/* Search Bar */}
+        <div className="border-b border-gray-300 p-3">
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search logs..."
+              className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-purple-500"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery("")}
+                className="px-3 py-1.5 text-sm text-purple-600 hover:text-purple-800 font-medium"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Logs Content */}
+        {loading && logs.length === 0 ? (
+          <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+            Loading logs...
+          </div>
+        ) : error ? (
+          <div className="flex items-center justify-center h-full text-red-600 text-sm p-4 text-center">
+            {error}
+          </div>
+        ) : logs.length === 0 ? (
+          <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+            {debouncedSearch ? "No logs found" : "No logs yet"}
+          </div>
+        ) : (
+          <div className="flex-1 overflow-auto p-4 font-mono text-xs">
+            {logs.map((log, idx) => (
+              <div key={idx} className="mb-1 flex gap-3">
+                <span className="text-gray-400 flex-shrink-0">
+                  {formatTimestamp(log.ts_sec, log.ts_nsec)}
+                </span>
+                <span className="text-gray-800">
+                  {renderLogWithHighlight(log.highlighted_log)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Window>
+  );
 }

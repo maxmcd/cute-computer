@@ -35,7 +35,9 @@ export function Window({
         </span>
 
         {/* Right Content (status, etc.) */}
-        {rightContent && <div className="ml-auto">{rightContent}</div>}
+        {rightContent && (
+          <div className="ml-auto font-mono">{rightContent}</div>
+        )}
       </div>
 
       {/* Window Content */}

@@ -13,10 +13,10 @@ function generateSlug(name: string): string {
   return name
     .toLowerCase()
     .trim()
-    .replace(/[^\w\s-]/g, '') // Remove special characters
-    .replace(/\s+/g, '-')      // Replace spaces with hyphens
-    .replace(/-+/g, '-')       // Replace multiple hyphens with single hyphen
-    .replace(/^-+|-+$/g, '');  // Remove leading/trailing hyphens
+    .replace(/[^\w\s-]/g, "") // Remove special characters
+    .replace(/\s+/g, "-") // Replace spaces with hyphens
+    .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
+    .replace(/^-+|-+$/g, ""); // Remove leading/trailing hyphens
 }
 
 export class Computers extends DurableObject<Env> {
@@ -32,14 +32,14 @@ export class Computers extends DurableObject<Env> {
     // Create computers table with both name and slug
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS computers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         slug TEXT NOT NULL UNIQUE,
         created_at INTEGER NOT NULL,
         secrets TEXT NOT NULL DEFAULT '[]'
       )
     `);
-    
+
     // Create index on slug for fast lookups
     this.sql.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_slug ON computers(slug)
@@ -61,7 +61,7 @@ export class Computers extends DurableObject<Env> {
 
     const name = displayName.trim();
     const baseSlug = generateSlug(name);
-    
+
     // If slug is empty after sanitization, return error
     if (!baseSlug) {
       return {
@@ -129,12 +129,12 @@ export class Computers extends DurableObject<Env> {
       `SELECT id, name, slug, created_at, secrets FROM computers WHERE slug = ?`,
       slug
     );
-    
+
     const rows = [...result];
     if (rows.length === 0) {
       return null;
     }
-    
+
     const computer = rows[0] as Computer;
 
     if (computer && (!computer.secrets || computer.secrets === "[]")) {
@@ -160,7 +160,12 @@ export class Computers extends DurableObject<Env> {
       .exec(
         `SELECT id, name, slug, created_at FROM computers ORDER BY created_at DESC`
       )
-      .toArray() as { id: number; name: string; slug: string; created_at: number }[];
+      .toArray() as {
+      id: number;
+      name: string;
+      slug: string;
+      created_at: number;
+    }[];
 
     return computers;
   }

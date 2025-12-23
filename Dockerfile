@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:trixie
 RUN apt-get update && apt-get install -y curl unzip media-types ca-certificates fuse \
 	&& rm -rf /var/lib/apt/lists/*
+
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
     if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \

@@ -16,6 +16,7 @@
       "class_name": "AppContainer",
       "image": "./Dockerfile",
       "max_instances": 10,
+      "instance_type": "standard-1",
       "rollout_active_grace_period": 0,
       "rollout_step_percentage": [100],
     },
@@ -33,6 +34,10 @@
       {
         "class_name": "Computers",
         "name": "COMPUTERS",
+      },
+      {
+        "class_name": "Logs",
+        "name": "LOGS",
       },
     ],
   },
@@ -54,6 +59,10 @@
     {
       "new_sqlite_classes": ["Computers"],
       "tag": "v2",
+    },
+    {
+      "new_sqlite_classes": ["Logs"],
+      "tag": "v4",
     },
   ],
   "upload_source_maps": true,

@@ -3,8 +3,34 @@ import { Container } from "@cloudflare/containers";
 import { S3 } from "./s3";
 import { Computers, type Computer } from "./computers";
 import { signToken } from "./lib/jwt";
+import { Logs } from "./logs";
 
-export { S3, Computers };
+export { S3, Computers, Logs };
+
+// Helper to smuggle environment variables through request headers
+const CONTAINER_ENV_HEADER = "X-Container-Env";
+
+function setContainerEnv(
+  request: Request,
+  envVars: Record<string, string>
+): Request {
+  const newRequest = new Request(request.url, request);
+  for (const [key, value] of request.headers.entries()) {
+    newRequest.headers.set(key, value);
+  }
+  newRequest.headers.set(CONTAINER_ENV_HEADER, JSON.stringify(envVars));
+  return newRequest;
+}
+
+function getContainerEnv(request: Request): Record<string, string> {
+  const header = request.headers.get(CONTAINER_ENV_HEADER);
+  if (!header) return {};
+  try {
+    return JSON.parse(header);
+  } catch {
+    return {};
+  }
+}
 
 declare module "react-router" {
   export interface AppLoadContext {
@@ -27,40 +53,26 @@ export class AppContainer extends Container<Env> {
   sleepAfter = "10m";
   // Environment variables passed to the container
   envVars = {
-    S3_AUTH_TOKEN: "", // Will be set from request header
+    S3_AUTH_TOKEN: "",
+    LOGS_ENDPOINT: "",
+    LOGS_TOKEN: "",
   };
 
-  // Override fetch to extract S3 token from header and set env vars
+  // Override fetch to extract env vars from header and set them
   override async fetch(request: Request): Promise<Response> {
-    // Extract S3 auth token from header (set by the worker before routing here)
-    const s3Token = request.headers.get("X-S3-Auth-Token");
-    
-    if (s3Token) {
-      // Set the token in environment variables before container starts
-      this.envVars.S3_AUTH_TOKEN = s3Token;
-      
-      // Remove the internal header before passing to container
+    const envVars = getContainerEnv(request);
+
+    if (Object.keys(envVars).length > 0) {
+      this.envVars = { ...this.envVars, ...envVars };
+
+      // Remove the env header before passing to container
       const cleanRequest = new Request(request.url, request);
-      cleanRequest.headers.delete("X-S3-Auth-Token");
-      
+      cleanRequest.headers.delete(CONTAINER_ENV_HEADER);
+
       return super.fetch(cleanRequest);
     }
-    
-    // No token provided, continue normally (shouldn't happen in production)
+
     return super.fetch(request);
-  }
-
-  // Optional lifecycle hooks
-  override async onStart() {
-    console.log("Container started successfully");
-  }
-
-  override onStop() {
-    console.log("Container successfully shut down");
-  }
-
-  override onError(error: unknown) {
-    console.log("Container error:", error);
   }
 }
 
@@ -115,98 +127,199 @@ async function getComputer(
   return computer;
 }
 
-export default {
-  fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+class Worker {
+  constructor(
+    private env: Env,
+    private ctx: ExecutionContext
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // Extract subdomain from Host header
-    // Format: subdomain.domain.tld or subdomain.localhost
-    const hostParts = url.host.split(".");
-    const subdomain = hostParts.length > 1 ? hostParts[0] : "";
-
-    // If we have a subdomain that isn't "localhost" or the main domain
-    // Route to the container by subdomain name
-    if (
-      !url.host.includes("workers.dev") && // dont expect subdomain stuff on workers.dev
-      url.host !== "cute.maxmcd.com" &&
-      url.hostname !== "host.lima.internal" &&
-      subdomain &&
-      subdomain !== "localhost"
-    ) {
-      // Validate that the computer exists before routing
-      const computer = await getComputer(env, subdomain);
-      if (!computer) {
-        return createComputerNotFoundPage(subdomain);
-      }
-      
-      // Generate JWT token for this computer
-      const secrets: string[] = JSON.parse(computer.secrets);
-      if (secrets.length === 0) {
-        return new Response("No secrets configured for computer", { status: 500 });
-      }
-      
-      const doId = env.APP_CONTAINER.idFromName(subdomain).toString();
-      const token = await signToken(
-        {
-          sub: subdomain,
-          bucket: `s3-${doId}`,
-          expiresIn: 86400, // 24 hours
-        },
-        secrets[0]
-      );
-      
-      // Add S3 auth token as header for container to use
-      const modifiedRequest = new Request(request.url, request);
-      modifiedRequest.headers.set("X-S3-Auth-Token", token);
-      
-      const stub = env.APP_CONTAINER.getByName(subdomain);
-      return stub.fetch(modifiedRequest);
-    }
-
+    // Check path-based routes first
     if (url.pathname.startsWith("/s3-")) {
-      const pathMatch = url.pathname.match(/^\/([^\/]+)/);
-      if (!pathMatch) {
-        return new Response("Invalid S3 path", { status: 400 });
-      }
-      const bucket = pathMatch[1].slice(4);
-      return env.S3.getByName(bucket).fetch(request);
+      return this.handleS3Request(request);
+    }
+    if (url.pathname.startsWith("/logs/")) {
+      return this.handleLogsRequest(request);
     }
     if (url.pathname.startsWith("/ws")) {
-      // Extract computer name from query parameter
-      const computerName = url.searchParams.get("name") || "default";
-
-      const computer = await getComputer(env, computerName);
-      if (!computer) {
-        // For WebSocket connections, return a proper error response
-        return new Response("Computer not found", { status: 404 });
-      }
-
-      // Generate JWT token for this computer
-      const secrets: string[] = JSON.parse(computer.secrets);
-      if (secrets.length === 0) {
-        return new Response("No secrets configured for computer", { status: 500 });
-      }
-      
-      const doId = env.APP_CONTAINER.idFromName(computerName).toString();
-      const token = await signToken(
-        {
-          sub: computerName,
-          bucket: `s3-${doId}`,
-          expiresIn: 86400, // 24 hours
-        },
-        secrets[0]
-      );
-      
-      // Add S3 auth token as header for container to use
-      const modifiedRequest = new Request(request.url, request);
-      modifiedRequest.headers.set("X-S3-Auth-Token", token);
-      
-      // Route to container instance by computer name
-      return env.APP_CONTAINER.getByName(computerName).fetch(modifiedRequest);
+      return this.handleWebSocketRequest(request);
     }
 
-    return requestHandler(request, {
-      cloudflare: { env, ctx },
+    // Check subdomain routing
+    const subdomain = this.extractSubdomain(url.hostname);
+    if (subdomain && this.isValidSubdomain(url.hostname, subdomain)) {
+      return this.handleSubdomainRequest(request, subdomain);
+    }
+
+    // Fallback to React Router
+    return this.handleReactRouterRequest(request);
+  }
+
+  private extractSubdomain(host: string): string | null {
+    const hostParts = host.split(".");
+    if (hostParts.length > 1) {
+      const subdomain = hostParts[0];
+      return subdomain !== "localhost" ? subdomain : null;
+    }
+    return null;
+  }
+
+  private isValidSubdomain(hostname: string, subdomain: string): boolean {
+    // Exclude special hostnames that shouldn't use subdomain routing
+    const excludedHosts = [
+      "workers.dev",
+      "cute.maxmcd.com",
+      "host.lima.internal",
+      "host.docker.internal",
+    ];
+
+    for (const excluded of excludedHosts) {
+      if (hostname.includes(excluded)) {
+        return false;
+      }
+    }
+
+    return subdomain !== "";
+  }
+
+  private async getComputerAndToken(
+    computerName: string
+  ): Promise<{ computer: Computer; token: string }> {
+    const computer = await getComputer(this.env, computerName);
+    if (!computer) {
+      throw new Error("Computer not found");
+    }
+
+    const secrets: string[] = JSON.parse(computer.secrets);
+    if (secrets.length === 0) {
+      throw new Error("No secrets configured");
+    }
+
+    const doId = this.env.APP_CONTAINER.idFromName(computerName).toString();
+    const token = await signToken(
+      {
+        sub: computerName,
+        bucket: `s3-${doId}`,
+        expiresIn: 86400, // 24 hours
+      },
+      secrets[0]
+    );
+
+    return { computer, token };
+  }
+
+  private createContainerRequest(
+    request: Request,
+    computerName: string,
+    token: string
+  ): Request {
+    // For some reason, in dev, the url host doesn't contain the port.
+    const hostHeader = request.headers.get("host") || "localhost";
+    const protocol = request.headers.get("x-forwarded-proto") || "http";
+    const origin = `${protocol}://${hostHeader}`;
+    return setContainerEnv(request, {
+      S3_AUTH_TOKEN: token,
+      LOGS_ENDPOINT: `${origin}/logs/${computerName}`,
+      LOGS_TOKEN: token,
     });
-  },
+  }
+
+  private async handleSubdomainRequest(
+    request: Request,
+    subdomain: string
+  ): Promise<Response> {
+    try {
+      const { token } = await this.getComputerAndToken(subdomain);
+      const stub = this.env.APP_CONTAINER.getByName(subdomain);
+      const requestWithEnv = this.createContainerRequest(
+        request,
+        subdomain,
+        token
+      );
+      return stub.fetch(requestWithEnv);
+    } catch (error) {
+      if (error instanceof Error && error.message === "Computer not found") {
+        return createComputerNotFoundPage(subdomain);
+      }
+      return new Response(
+        error instanceof Error ? error.message : "Internal server error",
+        { status: 500 }
+      );
+    }
+  }
+
+  private async handleS3Request(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathMatch = url.pathname.match(/^\/([^\/]+)/);
+    if (!pathMatch) {
+      return new Response("Invalid S3 path", { status: 400 });
+    }
+    const bucket = pathMatch[1].slice(4);
+    return this.env.S3.getByName(bucket).fetch(request);
+  }
+
+  private async handleLogsRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const pathParts = url.pathname.split("/").filter((p) => p);
+    if (pathParts.length < 2) {
+      return new Response("Invalid logs path", { status: 400 });
+    }
+    const computerName = pathParts[1];
+
+    // Rewrite URL path to remove /logs/:name prefix
+    // e.g., /logs/foo-boo/write -> /write
+    const remainingPath = pathParts.slice(2).join("/");
+    const newPath = remainingPath ? `/${remainingPath}` : "/";
+
+    const logsUrl = new URL(request.url);
+    logsUrl.pathname = newPath;
+
+    // Forward to Logs DO with rewritten path
+    const logsRequest = new Request(logsUrl.toString(), {
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+    });
+
+    const logsStub = this.env.LOGS.getByName(computerName);
+    return logsStub.fetch(logsRequest);
+  }
+
+  private async handleWebSocketRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const computerName = url.searchParams.get("name") || "default";
+
+    try {
+      const { token } = await this.getComputerAndToken(computerName);
+      const requestWithEnv = this.createContainerRequest(
+        request,
+        computerName,
+        token
+      );
+      return this.env.APP_CONTAINER.getByName(computerName).fetch(
+        requestWithEnv
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message === "Computer not found") {
+        return new Response("Computer not found", { status: 404 });
+      }
+      return new Response(
+        error instanceof Error ? error.message : "Internal server error",
+        { status: 500 }
+      );
+    }
+  }
+
+  private handleReactRouterRequest(request: Request): Promise<Response> {
+    return requestHandler(request, {
+      cloudflare: { env: this.env, ctx: this.ctx },
+    });
+  }
+}
+
+export default {
+  fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
+    new Worker(env, ctx).fetch(request),
 };
