@@ -13,16 +13,30 @@ interface S3Object {
 
 const CHUNK_SIZE = 1024 * 1024; // 1MB chunks to stay under 2MB SQLite limit
 
-export class S3 extends DurableObject<Env> {
-  sql: SqlStorage;
-  secretsCache: Map<string, string[]> = new Map();
-  
-  constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
-    this.sql = state.storage.sql;
+// Helper functions to compute depth and parent for a key
+function computeDepth(key: string): number {
+  return (key.match(/\//g) || []).length;
+}
 
-    // Objects table: chunk_index 0 has metadata, rest have empty strings
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS objects (
+function computeParent(key: string): string {
+  // Strip trailing slash, then find last slash
+  const trimmed = key.endsWith("/") ? key.slice(0, -1) : key;
+  const lastSlash = trimmed.lastIndexOf("/");
+  if (lastSlash === -1) {
+    return "";
+  }
+  return trimmed.slice(0, lastSlash + 1);
+}
+
+// Migration function type - receives the sql instance to run queries
+type MigrationFn = (sql: SqlStorage) => void;
+
+// Migrations are run in order. Each migration is a function that receives the sql instance.
+// Once a migration has been run, it should never be modified - add a new migration instead.
+const MIGRATIONS: MigrationFn[] = [
+  // Migration 0: Initial schema
+  (sql) => {
+    sql.exec(`CREATE TABLE IF NOT EXISTS objects (
       bucket TEXT NOT NULL,
       key TEXT NOT NULL,
       chunk_index INTEGER NOT NULL,
@@ -33,18 +47,17 @@ export class S3 extends DurableObject<Env> {
       data BLOB NOT NULL,
       PRIMARY KEY (bucket, key, chunk_index)
     )`);
-
-    // Multipart uploads metadata table
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS multipart_uploads (
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_objects_listing 
+     ON objects (bucket, key) 
+     WHERE chunk_index = 0`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS multipart_uploads (
       upload_id TEXT PRIMARY KEY,
       bucket TEXT NOT NULL,
       key TEXT NOT NULL,
       created_at TEXT NOT NULL,
       content_type TEXT NOT NULL
     )`);
-
-    // Multipart parts table: chunk_index 0 has metadata, rest have empty strings
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS multipart_parts (
+    sql.exec(`CREATE TABLE IF NOT EXISTS multipart_parts (
       upload_id TEXT NOT NULL,
       part_number INTEGER NOT NULL,
       chunk_index INTEGER NOT NULL,
@@ -53,6 +66,64 @@ export class S3 extends DurableObject<Env> {
       data BLOB NOT NULL,
       PRIMARY KEY (upload_id, part_number, chunk_index)
     )`);
+  },
+
+  // Migration 1: Add depth and parent columns for efficient directory listing
+  (sql) => {
+    sql.exec(`ALTER TABLE objects ADD COLUMN depth INTEGER`);
+    sql.exec(`ALTER TABLE objects ADD COLUMN parent TEXT`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_objects_parent 
+     ON objects (bucket, parent) 
+     WHERE chunk_index = 0`);
+
+    // Backfill existing rows with depth and parent values
+    const result = sql.exec(
+      `SELECT bucket, key FROM objects WHERE chunk_index = 0 AND (depth IS NULL OR parent IS NULL)`
+    );
+    for (const row of result) {
+      const r = row as { bucket: string; key: string };
+      const depth = computeDepth(r.key);
+      const parent = computeParent(r.key);
+      sql.exec(
+        `UPDATE objects SET depth = ?, parent = ? WHERE bucket = ? AND key = ? AND chunk_index = 0`,
+        depth,
+        parent,
+        r.bucket,
+        r.key
+      );
+    }
+  },
+];
+
+export class S3 extends DurableObject<Env> {
+  sql: SqlStorage;
+  secretsCache: Map<string, string[]> = new Map();
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.sql = state.storage.sql;
+    this.runMigrations();
+  }
+
+  private runMigrations() {
+    // Create migrations table if it doesn't exist
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+      version INTEGER PRIMARY KEY
+    )`);
+
+    // Get current migration version
+    const result = this.sql.exec(`SELECT COALESCE(MAX(version), -1) as version FROM _migrations`);
+    const rows = [...result] as any[];
+    const currentVersion = rows[0]?.version ?? -1;
+
+    // Run pending migrations
+    for (let i = currentVersion + 1; i < MIGRATIONS.length; i++) {
+      const migration = MIGRATIONS[i];
+      migration(this.sql);
+      
+      // Record that this migration has been run
+      this.sql.exec(`INSERT INTO _migrations (version) VALUES (?)`, i);
+    }
   }
 
   async fetch(request: Request) {
@@ -87,31 +158,52 @@ export class S3 extends DurableObject<Env> {
       // Format: AWS4-HMAC-SHA256 Credential=<jwt>/20231201/auto/s3/aws4_request, ...
       const credentialMatch = authHeader.match(/Credential=([^\/,]+)/);
       if (!credentialMatch) {
-        return this.errorResponse("Unauthorized", "Invalid AWS authorization format", 401);
+        return this.errorResponse(
+          "Unauthorized",
+          "Invalid AWS authorization format",
+          401
+        );
       }
       token = credentialMatch[1];
     } else {
-      return this.errorResponse("Unauthorized", "Unsupported authorization type", 401);
+      return this.errorResponse(
+        "Unauthorized",
+        "Unsupported authorization type",
+        401
+      );
     }
-    
+
+    // Dev mode: allow dummy credentials "foo" to bypass auth
+    // TODO: Remove this before production
+    if (token === "foo") {
+      // Extract key while preserving trailing slashes
+      const bucketPrefix = `/${bucket}`;
+      let key = "";
+      if (url.pathname.startsWith(bucketPrefix + "/")) {
+        key = url.pathname.slice(bucketPrefix.length + 1);
+        key = decodeURIComponent(key);
+      }
+      return this.handleRequest(bucket, key, method, request, url);
+    }
+
     // Decode JWT to get computer name (without verification yet)
-    const parts = token.split('.');
+    const parts = token.split(".");
     if (parts.length !== 3) {
       return this.errorResponse("Unauthorized", "Invalid token format", 401);
     }
-    
+
     const payloadJson = JSON.parse(atob(parts[1]));
     const computerName = payloadJson.sub;
-    
+
     if (!computerName) {
       return this.errorResponse("Unauthorized", "Invalid token claims", 401);
     }
-    
+
     // Get secrets (from cache or fetch)
     let secrets = this.secretsCache.get(computerName);
     let payload;
     let needsFetch = false;
-    
+
     // Try verification with cached secrets
     if (secrets) {
       try {
@@ -123,24 +215,26 @@ export class S3 extends DurableObject<Env> {
     } else {
       needsFetch = true;
     }
-    
+
     // Fetch secrets if not cached or verification failed
     if (needsFetch) {
-      const computersStub = this.env.COMPUTERS.get(this.env.COMPUTERS.idFromName("global"));
+      const computersStub = this.env.COMPUTERS.get(
+        this.env.COMPUTERS.idFromName("global")
+      );
       const computer = await computersStub.getComputer(computerName);
-      
+
       if (!computer) {
         return this.errorResponse("Unauthorized", "Computer not found", 401);
       }
-      
+
       const fetchedSecrets: string[] = JSON.parse(computer.secrets);
       if (fetchedSecrets.length === 0) {
         return this.errorResponse("Unauthorized", "No secrets configured", 401);
       }
-      
+
       // Cache the secrets
       this.secretsCache.set(computerName, fetchedSecrets);
-      
+
       // Verify token with fresh secrets
       try {
         payload = await verifyToken(token, fetchedSecrets);
@@ -150,14 +244,22 @@ export class S3 extends DurableObject<Env> {
     }
 
     if (!payload) {
-      return this.errorResponse("Unauthorized", "Token verification failed", 401);
+      return this.errorResponse(
+        "Unauthorized",
+        "Token verification failed",
+        401
+      );
     }
 
     // Verify token's bucket claim matches requested bucket
     if (payload.bucket !== bucket) {
-      return this.errorResponse("Forbidden", "Token not valid for this bucket", 403);
+      return this.errorResponse(
+        "Forbidden",
+        "Token not valid for this bucket",
+        403
+      );
     }
-    
+
     // Extract key while preserving trailing slashes
     // S3 treats "foo" and "foo/" as different keys (file vs directory marker)
     const bucketPrefix = `/${bucket}`;
@@ -170,9 +272,24 @@ export class S3 extends DurableObject<Env> {
       key = "";
     }
 
+    return this.handleRequest(bucket, key, method, request, url);
+  }
+
+  private async handleRequest(
+    bucket: string,
+    key: string,
+    method: string,
+    request: Request,
+    url: URL
+  ): Promise<Response> {
     // HEAD bucket (check if bucket exists)
     if (method === "HEAD" && !key) {
       return this.headBucket(bucket);
+    }
+
+    // GET bucket with ?uploads - ListMultipartUploads
+    if (method === "GET" && !key && url.searchParams.has("uploads")) {
+      return this.listMultipartUploads(bucket, url.searchParams);
     }
 
     // GET bucket (list objects) - supports both ListObjectsV2 and ListObjects
@@ -211,6 +328,12 @@ export class S3 extends DurableObject<Env> {
       }
     }
 
+    // CopyObject (PUT with x-amz-copy-source header)
+    const copySource = request.headers.get("x-amz-copy-source");
+    if (method === "PUT" && key && copySource) {
+      return this.copyObject(bucket, key, copySource);
+    }
+
     // PutObject
     if (method === "PUT" && key) {
       return this.putObject(bucket, key, request);
@@ -224,14 +347,14 @@ export class S3 extends DurableObject<Env> {
     return this.errorResponse(
       "NotImplemented",
       "Operation not implemented",
-      501,
+      501
     );
   }
 
   private async putObject(
     bucket: string,
     key: string,
-    request: Request,
+    request: Request
   ): Promise<Response> {
     try {
       const data = await request.arrayBuffer();
@@ -252,15 +375,17 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key,
+        key
       );
 
       // Store data in chunks
       const dataArray = new Uint8Array(data);
-      
+      const depth = computeDepth(key);
+      const parent = computeParent(key);
+
       // Always insert chunk 0 with metadata (even if empty)
       this.sql.exec(
-        `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         bucket,
         key,
         0,
@@ -268,7 +393,11 @@ export class S3 extends DurableObject<Env> {
         etag,
         lastModified,
         contentType,
-        size === 0 ? new ArrayBuffer(0) : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer,
+        size === 0
+          ? new ArrayBuffer(0)
+          : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer,
+        depth,
+        parent
       );
 
       // If file is larger than one chunk, store remaining chunks
@@ -277,9 +406,9 @@ export class S3 extends DurableObject<Env> {
         for (let offset = CHUNK_SIZE; offset < size; offset += CHUNK_SIZE) {
           const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
           const chunk = dataArray.slice(offset, chunkEnd);
-          
+
           this.sql.exec(
-            `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             bucket,
             key,
             chunkIndex,
@@ -288,6 +417,8 @@ export class S3 extends DurableObject<Env> {
             "",
             "",
             chunk.buffer,
+            null,
+            null
           );
           chunkIndex++;
         }
@@ -306,17 +437,137 @@ export class S3 extends DurableObject<Env> {
     }
   }
 
+  private async copyObject(
+    bucket: string,
+    destKey: string,
+    copySource: string
+  ): Promise<Response> {
+    try {
+      // Parse copy source: /bucket/key or bucket/key
+      let sourcePath = copySource;
+      if (sourcePath.startsWith("/")) {
+        sourcePath = sourcePath.slice(1);
+      }
+      
+      // Extract bucket and key from source path
+      const slashIndex = sourcePath.indexOf("/");
+      if (slashIndex === -1) {
+        return this.errorResponse("InvalidArgument", "Invalid copy source", 400);
+      }
+      
+      const sourceBucket = sourcePath.slice(0, slashIndex);
+      const sourceKey = decodeURIComponent(sourcePath.slice(slashIndex + 1));
+      
+      // For now, only support same-bucket copies
+      if (sourceBucket !== bucket) {
+        return this.errorResponse(
+          "InvalidArgument",
+          "Cross-bucket copy not supported",
+          400
+        );
+      }
+      
+      // Get source object metadata and data
+      const metaResult = this.sql.exec(
+        `SELECT size, etag, content_type FROM objects WHERE bucket = ? AND key = ? AND chunk_index = 0`,
+        sourceBucket,
+        sourceKey
+      );
+      const metaRows = [...metaResult] as any[];
+      
+      if (metaRows.length === 0) {
+        return this.errorResponse(
+          "NoSuchKey",
+          "The specified source key does not exist.",
+          404
+        );
+      }
+      
+      const sourceMeta = metaRows[0];
+      const lastModified = new Date().toISOString();
+      
+      // Delete existing destination object if any
+      this.sql.exec(
+        `DELETE FROM objects WHERE bucket = ? AND key = ?`,
+        bucket,
+        destKey
+      );
+      
+      // Copy all chunks from source to destination
+      const chunksResult = this.sql.exec(
+        `SELECT chunk_index, data FROM objects WHERE bucket = ? AND key = ? ORDER BY chunk_index`,
+        sourceBucket,
+        sourceKey
+      );
+      const chunks = [...chunksResult] as any[];
+      const depth = computeDepth(destKey);
+      const parent = computeParent(destKey);
+      
+      for (const chunk of chunks) {
+        if (chunk.chunk_index === 0) {
+          // First chunk has metadata
+          this.sql.exec(
+            `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            bucket,
+            destKey,
+            0,
+            sourceMeta.size,
+            sourceMeta.etag,
+            lastModified,
+            sourceMeta.content_type,
+            chunk.data,
+            depth,
+            parent
+          );
+        } else {
+          // Other chunks have empty metadata
+          this.sql.exec(
+            `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            bucket,
+            destKey,
+            chunk.chunk_index,
+            0,
+            "",
+            "",
+            "",
+            chunk.data,
+            null,
+            null
+          );
+        }
+      }
+      
+      // Return CopyObjectResult XML
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <LastModified>${lastModified}</LastModified>
+  <ETag>"${this.escapeXml(sourceMeta.etag)}"</ETag>
+</CopyObjectResult>`;
+      
+      return new Response(xml, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/xml",
+          "x-amz-request-id": crypto.randomUUID(),
+        },
+      });
+    } catch (error) {
+      console.error("CopyObject error:", error);
+      return this.errorResponse("InternalError", "Failed to copy object", 500);
+    }
+  }
+
   private async getObject(
     bucket: string,
     key: string,
-    headOnly: boolean,
+    headOnly: boolean
   ): Promise<Response> {
     try {
       // Get metadata from chunk 0
       const result = this.sql.exec(
         `SELECT size, etag, last_modified, content_type FROM objects WHERE bucket = ? AND key = ? AND chunk_index = 0`,
         bucket,
-        key,
+        key
       );
 
       const rows = [...result];
@@ -324,7 +575,7 @@ export class S3 extends DurableObject<Env> {
         return this.errorResponse(
           "NoSuchKey",
           "The specified key does not exist.",
-          404,
+          404
         );
       }
 
@@ -345,7 +596,7 @@ export class S3 extends DurableObject<Env> {
       const chunksResult = this.sql.exec(
         `SELECT data FROM objects WHERE bucket = ? AND key = ? ORDER BY chunk_index`,
         bucket,
-        key,
+        key
       );
       const chunks = [...chunksResult] as any[];
 
@@ -370,7 +621,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to retrieve object",
-        500,
+        500
       );
     }
   }
@@ -380,7 +631,7 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key,
+        key
       );
 
       return new Response(null, {
@@ -394,7 +645,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to delete object",
-        500,
+        500
       );
     }
   }
@@ -412,7 +663,7 @@ export class S3 extends DurableObject<Env> {
 
   private async listObjectsV2(
     bucket: string,
-    params: URLSearchParams,
+    params: URLSearchParams
   ): Promise<Response> {
     try {
       const prefix = params.get("prefix") || "";
@@ -421,44 +672,194 @@ export class S3 extends DurableObject<Env> {
       const startAfter = params.get("start-after") || "";
       const continuationToken = params.get("continuation-token") || "";
 
-      let query = `SELECT key, size, etag, last_modified FROM objects WHERE bucket = ? AND chunk_index = 0`;
-      const queryParams: any[] = [bucket];
-
-      if (prefix) {
-        query += ` AND key LIKE ?`;
-        queryParams.push(`${prefix}%`);
-      }
-
-      if (continuationToken || startAfter) {
-        query += ` AND key > ?`;
-        queryParams.push(continuationToken || startAfter);
-      }
-
-      query += ` ORDER BY key LIMIT ?`;
-      queryParams.push(maxKeys + 1); // Get one extra to determine if truncated
-
-      const result = this.sql.exec(query, ...queryParams);
-      const rows = [...result] as any[];
-
-      const isTruncated = rows.length > maxKeys;
-      const objects = rows.slice(0, maxKeys);
-
+      let objects: any[] = [];
+      let commonPrefixes: string[] = [];
+      let isTruncated = false;
       let nextContinuationToken = "";
-      if (isTruncated && objects.length > 0) {
-        nextContinuationToken = objects[objects.length - 1].key; // last key
+
+      if (delimiter === "/") {
+        // Optimized path for "/" delimiter using parent column
+        // Query 1: Get CommonPrefixes (distinct parent directories at this level)
+        const prefixDepth = computeDepth(prefix);
+        const targetDepth = prefixDepth + 1;
+
+        let prefixQuery = `SELECT DISTINCT parent FROM objects WHERE bucket = ? AND chunk_index = 0 AND depth >= ?`;
+        const prefixQueryParams: any[] = [bucket, targetDepth];
+
+        if (prefix) {
+          prefixQuery += ` AND parent >= ? AND parent < ?`;
+          prefixQueryParams.push(prefix);
+          const prefixUpperBound = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+          prefixQueryParams.push(prefixUpperBound);
+        }
+
+        if (continuationToken || startAfter) {
+          // For pagination, we need to skip past already-seen prefixes
+          const marker = continuationToken || startAfter;
+          prefixQuery += ` AND parent > ?`;
+          prefixQueryParams.push(computeParent(marker) || marker);
+        }
+
+        prefixQuery += ` ORDER BY parent LIMIT ?`;
+        prefixQueryParams.push(maxKeys + 1);
+
+        const prefixResult = this.sql.exec(prefixQuery, ...prefixQueryParams);
+        const prefixRows = [...prefixResult] as any[];
+        
+        // Filter to only include prefixes at exactly the target level
+        for (const row of prefixRows) {
+          if (row.parent && row.parent.startsWith(prefix) && computeDepth(row.parent) === targetDepth) {
+            if (!commonPrefixes.includes(row.parent)) {
+              commonPrefixes.push(row.parent);
+            }
+          }
+        }
+
+        // Query 2: Get Contents (files directly at this level, where parent === prefix)
+        let contentsQuery = `SELECT key, size, etag, last_modified FROM objects WHERE bucket = ? AND chunk_index = 0 AND parent = ?`;
+        const contentsQueryParams: any[] = [bucket, prefix];
+
+        if (continuationToken || startAfter) {
+          contentsQuery += ` AND key > ?`;
+          contentsQueryParams.push(continuationToken || startAfter);
+        }
+
+        contentsQuery += ` ORDER BY key LIMIT ?`;
+        contentsQueryParams.push(maxKeys + 1);
+
+        const contentsResult = this.sql.exec(contentsQuery, ...contentsQueryParams);
+        objects = [...contentsResult] as any[];
+
+        // Merge and sort results, apply maxKeys limit
+        // S3 returns CommonPrefixes and Contents interleaved by sort order
+        const allResults: { type: 'prefix' | 'content', value: string, data?: any }[] = [];
+        
+        for (const cp of commonPrefixes) {
+          allResults.push({ type: 'prefix', value: cp });
+        }
+        for (const obj of objects) {
+          allResults.push({ type: 'content', value: obj.key, data: obj });
+        }
+        
+        // Sort by value (key or prefix)
+        allResults.sort((a, b) => a.value.localeCompare(b.value));
+
+        // Apply maxKeys limit
+        if (allResults.length > maxKeys) {
+          isTruncated = true;
+          allResults.splice(maxKeys);
+          const lastItem = allResults[allResults.length - 1];
+          nextContinuationToken = lastItem.value;
+        }
+
+        // Split back into commonPrefixes and objects
+        commonPrefixes = [];
+        objects = [];
+        for (const item of allResults) {
+          if (item.type === 'prefix') {
+            commonPrefixes.push(item.value);
+          } else {
+            objects.push(item.data);
+          }
+        }
+      } else if (delimiter) {
+        // Non-"/" delimiter: fall back to post-query filtering
+        let query = `SELECT key, size, etag, last_modified FROM objects WHERE bucket = ? AND chunk_index = 0`;
+        const queryParams: any[] = [bucket];
+
+        if (prefix) {
+          query += ` AND key >= ? AND key < ?`;
+          queryParams.push(prefix);
+          const prefixUpperBound = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+          queryParams.push(prefixUpperBound);
+        }
+
+        if (continuationToken || startAfter) {
+          query += ` AND key > ?`;
+          queryParams.push(continuationToken || startAfter);
+        }
+
+        query += ` ORDER BY key LIMIT ?`;
+        // Fetch more than maxKeys since we'll be collapsing some into CommonPrefixes
+        queryParams.push(maxKeys * 10 + 1);
+
+        const result = this.sql.exec(query, ...queryParams);
+        const rows = [...result] as any[];
+
+        const seenPrefixes = new Set<string>();
+        let count = 0;
+
+        for (const row of rows) {
+          if (count >= maxKeys) {
+            isTruncated = true;
+            break;
+          }
+
+          const keyAfterPrefix = row.key.slice(prefix.length);
+          const delimiterIndex = keyAfterPrefix.indexOf(delimiter);
+
+          if (delimiterIndex >= 0) {
+            // This key contains the delimiter, extract CommonPrefix
+            const commonPrefix = prefix + keyAfterPrefix.slice(0, delimiterIndex + 1);
+            if (!seenPrefixes.has(commonPrefix)) {
+              seenPrefixes.add(commonPrefix);
+              commonPrefixes.push(commonPrefix);
+              count++;
+              nextContinuationToken = row.key;
+            }
+          } else {
+            // Direct content at this level
+            objects.push(row);
+            count++;
+            nextContinuationToken = row.key;
+          }
+        }
+      } else {
+        // No delimiter: simple listing
+        let query = `SELECT key, size, etag, last_modified FROM objects WHERE bucket = ? AND chunk_index = 0`;
+        const queryParams: any[] = [bucket];
+
+        if (prefix) {
+          query += ` AND key >= ? AND key < ?`;
+          queryParams.push(prefix);
+          const prefixUpperBound = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+          queryParams.push(prefixUpperBound);
+        }
+
+        if (continuationToken || startAfter) {
+          query += ` AND key > ?`;
+          queryParams.push(continuationToken || startAfter);
+        }
+
+        query += ` ORDER BY key LIMIT ?`;
+        queryParams.push(maxKeys + 1);
+
+        const result = this.sql.exec(query, ...queryParams);
+        const rows = [...result] as any[];
+
+        isTruncated = rows.length > maxKeys;
+        objects = rows.slice(0, maxKeys);
+
+        if (isTruncated && objects.length > 0) {
+          nextContinuationToken = objects[objects.length - 1].key;
+        }
       }
 
       // Build XML response
+      const keyCount = objects.length + commonPrefixes.length;
       let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
       xml +=
         '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n';
       xml += `  <Name>${this.escapeXml(bucket)}</Name>\n`;
       xml += `  <Prefix>${this.escapeXml(prefix)}</Prefix>\n`;
-      xml += `  <KeyCount>${objects.length}</KeyCount>\n`;
+      if (delimiter) {
+        xml += `  <Delimiter>${this.escapeXml(delimiter)}</Delimiter>\n`;
+      }
+      xml += `  <KeyCount>${keyCount}</KeyCount>\n`;
       xml += `  <MaxKeys>${maxKeys}</MaxKeys>\n`;
       xml += `  <IsTruncated>${isTruncated}</IsTruncated>\n`;
 
-      if (nextContinuationToken) {
+      if (nextContinuationToken && isTruncated) {
         xml += `  <NextContinuationToken>${this.escapeXml(nextContinuationToken)}</NextContinuationToken>\n`;
       }
 
@@ -470,6 +871,12 @@ export class S3 extends DurableObject<Env> {
         xml += `    <Size>${row.size}</Size>\n`;
         xml += `    <StorageClass>STANDARD</StorageClass>\n`;
         xml += "  </Contents>\n";
+      }
+
+      for (const cp of commonPrefixes) {
+        xml += "  <CommonPrefixes>\n";
+        xml += `    <Prefix>${this.escapeXml(cp)}</Prefix>\n`;
+        xml += "  </CommonPrefixes>\n";
       }
 
       xml += "</ListBucketResult>";
@@ -487,10 +894,106 @@ export class S3 extends DurableObject<Env> {
     }
   }
 
+  private async listMultipartUploads(
+    bucket: string,
+    params: URLSearchParams
+  ): Promise<Response> {
+    try {
+      const prefix = params.get("prefix") || "";
+      const keyMarker = params.get("key-marker") || "";
+      const uploadIdMarker = params.get("upload-id-marker") || "";
+      const maxUploads = parseInt(params.get("max-uploads") || "1000");
+
+      let query = `SELECT upload_id, bucket, key, created_at FROM multipart_uploads WHERE bucket = ?`;
+      const queryParams: any[] = [bucket];
+
+      if (prefix) {
+        // Use range query instead of LIKE to avoid special character escaping issues
+        query += ` AND key >= ? AND key < ?`;
+        queryParams.push(prefix);
+        const prefixUpperBound = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+        queryParams.push(prefixUpperBound);
+      }
+
+      if (keyMarker) {
+        if (uploadIdMarker) {
+          // If both markers are set, start after the specific upload
+          query += ` AND (key > ? OR (key = ? AND upload_id > ?))`;
+          queryParams.push(keyMarker, keyMarker, uploadIdMarker);
+        } else {
+          query += ` AND key > ?`;
+          queryParams.push(keyMarker);
+        }
+      }
+
+      query += ` ORDER BY key, upload_id LIMIT ?`;
+      queryParams.push(maxUploads + 1);
+
+      const result = this.sql.exec(query, ...queryParams);
+      const rows = [...result] as any[];
+
+      const isTruncated = rows.length > maxUploads;
+      const uploads = rows.slice(0, maxUploads);
+
+      let nextKeyMarker = "";
+      let nextUploadIdMarker = "";
+      if (isTruncated && uploads.length > 0) {
+        const lastUpload = uploads[uploads.length - 1];
+        nextKeyMarker = lastUpload.key;
+        nextUploadIdMarker = lastUpload.upload_id;
+      }
+
+      // Build XML response
+      let xml = '<?xml version="1.0" encoding="UTF-8"?>\n';
+      xml +=
+        '<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">\n';
+      xml += `  <Bucket>${this.escapeXml(bucket)}</Bucket>\n`;
+      xml += `  <KeyMarker>${this.escapeXml(keyMarker)}</KeyMarker>\n`;
+      xml += `  <UploadIdMarker>${this.escapeXml(uploadIdMarker)}</UploadIdMarker>\n`;
+      xml += `  <MaxUploads>${maxUploads}</MaxUploads>\n`;
+      xml += `  <IsTruncated>${isTruncated}</IsTruncated>\n`;
+
+      if (prefix) {
+        xml += `  <Prefix>${this.escapeXml(prefix)}</Prefix>\n`;
+      }
+
+      if (isTruncated) {
+        xml += `  <NextKeyMarker>${this.escapeXml(nextKeyMarker)}</NextKeyMarker>\n`;
+        xml += `  <NextUploadIdMarker>${this.escapeXml(nextUploadIdMarker)}</NextUploadIdMarker>\n`;
+      }
+
+      for (const row of uploads) {
+        xml += "  <Upload>\n";
+        xml += `    <Key>${this.escapeXml(row.key)}</Key>\n`;
+        xml += `    <UploadId>${this.escapeXml(row.upload_id)}</UploadId>\n`;
+        xml += `    <Initiated>${new Date(row.created_at).toISOString()}</Initiated>\n`;
+        xml += `    <StorageClass>STANDARD</StorageClass>\n`;
+        xml += "  </Upload>\n";
+      }
+
+      xml += "</ListMultipartUploadsResult>";
+
+      return new Response(xml, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/xml",
+          "x-amz-request-id": crypto.randomUUID(),
+        },
+      });
+    } catch (error) {
+      console.error("ListMultipartUploads error:", error);
+      return this.errorResponse(
+        "InternalError",
+        "Failed to list multipart uploads",
+        500
+      );
+    }
+  }
+
   private async createMultipartUpload(
     bucket: string,
     key: string,
-    request: Request,
+    request: Request
   ): Promise<Response> {
     try {
       const uploadId = crypto.randomUUID();
@@ -504,7 +1007,7 @@ export class S3 extends DurableObject<Env> {
         bucket,
         key,
         createdAt,
-        contentType,
+        contentType
       );
 
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -526,7 +1029,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to create multipart upload",
-        500,
+        500
       );
     }
   }
@@ -536,7 +1039,7 @@ export class S3 extends DurableObject<Env> {
     key: string,
     uploadId: string,
     partNumber: number,
-    request: Request,
+    request: Request
   ): Promise<Response> {
     try {
       const data = await request.arrayBuffer();
@@ -553,12 +1056,12 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ? AND part_number = ?`,
         uploadId,
-        partNumber,
+        partNumber
       );
 
       // Store data in chunks
       const dataArray = new Uint8Array(data);
-      
+
       // Always insert chunk 0 with metadata (even if empty)
       this.sql.exec(
         `INSERT INTO multipart_parts (upload_id, part_number, chunk_index, size, etag, data) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -567,7 +1070,9 @@ export class S3 extends DurableObject<Env> {
         0,
         size,
         etag,
-        size === 0 ? new ArrayBuffer(0) : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer,
+        size === 0
+          ? new ArrayBuffer(0)
+          : dataArray.slice(0, Math.min(CHUNK_SIZE, size)).buffer
       );
 
       // If part is larger than one chunk, store remaining chunks
@@ -576,7 +1081,7 @@ export class S3 extends DurableObject<Env> {
         for (let offset = CHUNK_SIZE; offset < size; offset += CHUNK_SIZE) {
           const chunkEnd = Math.min(offset + CHUNK_SIZE, size);
           const chunk = dataArray.slice(offset, chunkEnd);
-          
+
           this.sql.exec(
             `INSERT INTO multipart_parts (upload_id, part_number, chunk_index, size, etag, data) VALUES (?, ?, ?, ?, ?, ?)`,
             uploadId,
@@ -584,7 +1089,7 @@ export class S3 extends DurableObject<Env> {
             chunkIndex,
             0,
             "",
-            chunk.buffer,
+            chunk.buffer
           );
           chunkIndex++;
         }
@@ -607,13 +1112,13 @@ export class S3 extends DurableObject<Env> {
     bucket: string,
     key: string,
     uploadId: string,
-    request: Request,
+    request: Request
   ): Promise<Response> {
     try {
       // Get upload metadata
       const uploadResult = this.sql.exec(
         `SELECT content_type FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId,
+        uploadId
       );
       const uploads = [...uploadResult] as any[];
 
@@ -621,7 +1126,7 @@ export class S3 extends DurableObject<Env> {
         return this.errorResponse(
           "NoSuchUpload",
           "The specified upload does not exist",
-          404,
+          404
         );
       }
 
@@ -630,7 +1135,7 @@ export class S3 extends DurableObject<Env> {
       // Get all parts metadata (chunk 0 only), ordered by part number
       const partsResult = this.sql.exec(
         `SELECT part_number, size, etag FROM multipart_parts WHERE upload_id = ? AND chunk_index = 0 ORDER BY part_number`,
-        uploadId,
+        uploadId
       );
       const parts = [...partsResult] as any[];
 
@@ -648,19 +1153,21 @@ export class S3 extends DurableObject<Env> {
       this.sql.exec(
         `DELETE FROM objects WHERE bucket = ? AND key = ?`,
         bucket,
-        key,
+        key
       );
 
       // Copy part chunks to object chunks, re-indexing them
       let objectChunkIndex = 0;
       const lastModified = new Date().toISOString();
       const etag = `${crypto.randomUUID().replace(/-/g, "")}-${parts.length}`;
+      const depth = computeDepth(key);
+      const parent = computeParent(key);
 
       for (const part of parts) {
         const partChunksResult = this.sql.exec(
           `SELECT data FROM multipart_parts WHERE upload_id = ? AND part_number = ? ORDER BY chunk_index`,
           uploadId,
-          part.part_number,
+          part.part_number
         );
         const partChunks = [...partChunksResult] as any[];
 
@@ -668,7 +1175,7 @@ export class S3 extends DurableObject<Env> {
           // First chunk (index 0) has metadata, rest have empty strings
           if (objectChunkIndex === 0) {
             this.sql.exec(
-              `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               bucket,
               key,
               objectChunkIndex,
@@ -677,10 +1184,12 @@ export class S3 extends DurableObject<Env> {
               lastModified,
               contentType,
               chunk.data,
+              depth,
+              parent
             );
           } else {
             this.sql.exec(
-              `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              `INSERT INTO objects (bucket, key, chunk_index, size, etag, last_modified, content_type, data, depth, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               bucket,
               key,
               objectChunkIndex,
@@ -689,6 +1198,8 @@ export class S3 extends DurableObject<Env> {
               "",
               "",
               chunk.data,
+              null,
+              null
             );
           }
           objectChunkIndex++;
@@ -698,11 +1209,11 @@ export class S3 extends DurableObject<Env> {
       // Clean up multipart upload data
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ?`,
-        uploadId,
+        uploadId
       );
       this.sql.exec(
         `DELETE FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId,
+        uploadId
       );
 
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -725,7 +1236,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to complete multipart upload",
-        500,
+        500
       );
     }
   }
@@ -734,11 +1245,11 @@ export class S3 extends DurableObject<Env> {
     try {
       this.sql.exec(
         `DELETE FROM multipart_parts WHERE upload_id = ?`,
-        uploadId,
+        uploadId
       );
       this.sql.exec(
         `DELETE FROM multipart_uploads WHERE upload_id = ?`,
-        uploadId,
+        uploadId
       );
 
       return new Response(null, {
@@ -752,7 +1263,7 @@ export class S3 extends DurableObject<Env> {
       return this.errorResponse(
         "InternalError",
         "Failed to abort multipart upload",
-        500,
+        500
       );
     }
   }
@@ -760,7 +1271,7 @@ export class S3 extends DurableObject<Env> {
   private errorResponse(
     code: string,
     message: string,
-    status: number,
+    status: number
   ): Response {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Error>

@@ -10,6 +10,8 @@ import {
   UploadPartCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
+  ListMultipartUploadsCommand,
+  CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { describe, it, expect, beforeAll } from "vitest";
 import { DOMParser } from "@xmldom/xmldom";
@@ -240,6 +242,190 @@ describe("S3 with AWS SDK", () => {
     expect(keys.includes("bar/c.txt")).toBe(false);
   });
 
+  it("can list objects with delimiter (directory-style listing)", async () => {
+    const doName = "delimiter-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Create a directory-like structure
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "root.txt", Body: "root" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "dir1/file1.txt", Body: "f1" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "dir1/file2.txt", Body: "f2" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "dir1/subdir/file3.txt", Body: "f3" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "dir2/file4.txt", Body: "f4" })
+    );
+
+    // List with delimiter at root - should get root.txt as Contents, dir1/ and dir2/ as CommonPrefixes
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket, Delimiter: "/" })
+    );
+
+    // Should only have root.txt as a direct object
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys.includes("root.txt")).toBe(true);
+    expect(keys.includes("dir1/file1.txt")).toBe(false); // Should be collapsed into CommonPrefix
+
+    // Should have dir1/ and dir2/ as common prefixes
+    const prefixes = listResult.CommonPrefixes?.map((p) => p.Prefix) || [];
+    expect(prefixes.includes("dir1/")).toBe(true);
+    expect(prefixes.includes("dir2/")).toBe(true);
+  });
+
+  it("can list objects with prefix and delimiter", async () => {
+    const doName = "prefix-delimiter-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Create nested structure like node_modules
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "app/node_modules/lodash/index.js", Body: "a" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "app/node_modules/lodash/package.json", Body: "b" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "app/node_modules/express/index.js", Body: "c" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "app/node_modules/express/lib/router.js", Body: "d" })
+    );
+
+    // List with prefix "app/node_modules/" and delimiter "/" - should get package directories
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ 
+        Bucket: bucket, 
+        Prefix: "app/node_modules/",
+        Delimiter: "/" 
+      })
+    );
+
+    // Should have no direct Contents (all files are in subdirectories)
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys.length).toBe(0);
+
+    // Should have lodash/ and express/ as common prefixes
+    const prefixes = listResult.CommonPrefixes?.map((p) => p.Prefix) || [];
+    expect(prefixes.includes("app/node_modules/lodash/")).toBe(true);
+    expect(prefixes.includes("app/node_modules/express/")).toBe(true);
+    expect(prefixes.length).toBe(2);
+  });
+
+  it("can list objects with non-slash delimiter", async () => {
+    const doName = "non-slash-delimiter-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Create keys using "-" as a logical delimiter
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "logs-2024-01-01.txt", Body: "a" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "logs-2024-01-02.txt", Body: "b" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "logs-2024-02-01.txt", Body: "c" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "logs-2025-01-01.txt", Body: "d" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "other.txt", Body: "e" })
+    );
+
+    // List with prefix "logs-" and delimiter "-" - should group by year
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ 
+        Bucket: bucket, 
+        Prefix: "logs-",
+        Delimiter: "-" 
+      })
+    );
+
+    // Should have no direct Contents (all have delimiter after prefix)
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(keys.length).toBe(0);
+
+    // Should have "logs-2024-" and "logs-2025-" as common prefixes
+    const prefixes = listResult.CommonPrefixes?.map((p) => p.Prefix) || [];
+    expect(prefixes.includes("logs-2024-")).toBe(true);
+    expect(prefixes.includes("logs-2025-")).toBe(true);
+    expect(prefixes.length).toBe(2);
+
+    // "other.txt" should not appear (doesn't match prefix)
+  });
+
+  it("can list objects with prefix containing special characters", async () => {
+    const doName = "prefix-special-chars-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Test with characters that would break LIKE patterns: %, _, and other special chars
+    const specialPrefix = "2412b134a4ad3ccbb04eabcb221eb96bca21c62b:package.json/";
+    
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: `${specialPrefix}file1.txt`, Body: "a" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: `${specialPrefix}file2.txt`, Body: "b" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "other/file.txt", Body: "c" })
+    );
+
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: specialPrefix })
+    );
+
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(listResult.KeyCount).toBe(2);
+    expect(keys.includes(`${specialPrefix}file1.txt`)).toBe(true);
+    expect(keys.includes(`${specialPrefix}file2.txt`)).toBe(true);
+    expect(keys.includes("other/file.txt")).toBe(false);
+  });
+
+  it("can list objects with prefix containing LIKE special characters", async () => {
+    const doName = "prefix-like-chars-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Test with LIKE pattern special characters: % and _
+    const specialPrefix = "test_prefix%weird/";
+    
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: `${specialPrefix}file1.txt`, Body: "a" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: `${specialPrefix}file2.txt`, Body: "b" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "test_other/file.txt", Body: "c" })
+    );
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: "testXprefixYweird/file.txt", Body: "d" })
+    );
+
+    const listResult = await s3Client.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: specialPrefix })
+    );
+
+    const keys = listResult.Contents?.map((obj) => obj.Key) || [];
+    expect(listResult.KeyCount).toBe(2);
+    expect(keys.includes(`${specialPrefix}file1.txt`)).toBe(true);
+    expect(keys.includes(`${specialPrefix}file2.txt`)).toBe(true);
+    // These should NOT match - they would match if we were using LIKE incorrectly
+    expect(keys.includes("test_other/file.txt")).toBe(false);
+    expect(keys.includes("testXprefixYweird/file.txt")).toBe(false);
+  });
+
   it("can handle large files with chunking", async () => {
     const doName = "chunk-test";
     const s3Client = await createS3ClientForBucket(doName);
@@ -467,6 +653,48 @@ describe("S3 with AWS SDK", () => {
     ).rejects.toThrow();
   });
 
+  it("can DELETE deeply nested directory markers with trailing slash", async () => {
+    const doName = "delete-nested-dir-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // This mimics the real failing case: my-react-router-app/node_modules/iconv-lite/encodings/
+    const deepKey = "my-react-router-app/node_modules/iconv-lite/encodings/";
+    
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: deepKey, Body: "" })
+    );
+
+    // Verify it exists
+    const headResult = await s3Client.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: deepKey })
+    );
+    expect(headResult.$metadata.httpStatusCode).toBe(200);
+
+    // Delete it
+    const deleteResult = await s3Client.send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: deepKey })
+    );
+    expect(deleteResult.$metadata.httpStatusCode).toBe(204);
+
+    // Verify it's gone
+    await expect(
+      s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: deepKey }))
+    ).rejects.toThrow();
+  });
+
+  it("returns 204 when deleting non-existent object (S3 standard behavior)", async () => {
+    const doName = "delete-nonexistent-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // S3 returns 204 even when deleting an object that doesn't exist
+    const deleteResult = await s3Client.send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: "does-not-exist.txt" })
+    );
+    expect(deleteResult.$metadata.httpStatusCode).toBe(204);
+  });
+
   it("treats foo and foo/ as distinct keys", async () => {
     const doName = "distinct-keys-test";
     const s3Client = await createS3ClientForBucket(doName);
@@ -541,5 +769,225 @@ describe("S3 with AWS SDK", () => {
     expect(keys.includes("a/b/")).toBe(true);
     expect(keys.includes("a/b/file.txt")).toBe(true);
     expect(keys.includes("a/file2.txt")).toBe(true);
+  });
+
+  it("can list multipart uploads", async () => {
+    const doName = "list-multipart-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Create a few multipart uploads
+    const upload1 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "file1.txt" })
+    );
+    const upload2 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "file2.txt" })
+    );
+    const upload3 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "dir/file3.txt" })
+    );
+
+    // List all multipart uploads
+    const listResult = await s3Client.send(
+      new ListMultipartUploadsCommand({ Bucket: bucket })
+    );
+
+    expect(listResult.Uploads).toHaveLength(3);
+    const keys = listResult.Uploads?.map((u) => u.Key) || [];
+    expect(keys.includes("file1.txt")).toBe(true);
+    expect(keys.includes("file2.txt")).toBe(true);
+    expect(keys.includes("dir/file3.txt")).toBe(true);
+
+    // Verify upload IDs are present
+    const uploadIds = listResult.Uploads?.map((u) => u.UploadId) || [];
+    expect(uploadIds.includes(upload1.UploadId)).toBe(true);
+    expect(uploadIds.includes(upload2.UploadId)).toBe(true);
+    expect(uploadIds.includes(upload3.UploadId)).toBe(true);
+
+    // Clean up
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "file1.txt",
+        UploadId: upload1.UploadId,
+      })
+    );
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "file2.txt",
+        UploadId: upload2.UploadId,
+      })
+    );
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "dir/file3.txt",
+        UploadId: upload3.UploadId,
+      })
+    );
+  });
+
+  it("can list multipart uploads with prefix", async () => {
+    const doName = "list-multipart-prefix-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    // Create multipart uploads with different prefixes
+    const upload1 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "foo/a.txt" })
+    );
+    const upload2 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "foo/b.txt" })
+    );
+    const upload3 = await s3Client.send(
+      new CreateMultipartUploadCommand({ Bucket: bucket, Key: "bar/c.txt" })
+    );
+
+    // List with prefix
+    const listResult = await s3Client.send(
+      new ListMultipartUploadsCommand({ Bucket: bucket, Prefix: "foo/" })
+    );
+
+    expect(listResult.Uploads).toHaveLength(2);
+    const keys = listResult.Uploads?.map((u) => u.Key) || [];
+    expect(keys.includes("foo/a.txt")).toBe(true);
+    expect(keys.includes("foo/b.txt")).toBe(true);
+    expect(keys.includes("bar/c.txt")).toBe(false);
+
+    // Clean up
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "foo/a.txt",
+        UploadId: upload1.UploadId,
+      })
+    );
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "foo/b.txt",
+        UploadId: upload2.UploadId,
+      })
+    );
+    await s3Client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: "bar/c.txt",
+        UploadId: upload3.UploadId,
+      })
+    );
+  });
+
+  it("returns empty list when no multipart uploads exist", async () => {
+    const doName = "empty-multipart-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    const listResult = await s3Client.send(
+      new ListMultipartUploadsCommand({ Bucket: bucket })
+    );
+
+    expect(listResult.Uploads).toBeUndefined();
+    expect(listResult.IsTruncated).toBe(false);
+  });
+
+  it("can copy an object", async () => {
+    const doName = "copy-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+    const sourceKey = "source-file.txt";
+    const destKey = "dest-file.txt";
+    const content = "Hello, this is the content to copy!";
+
+    // Create source object
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: sourceKey, Body: content })
+    );
+
+    // Copy object
+    const copyResult = await s3Client.send(
+      new CopyObjectCommand({
+        Bucket: bucket,
+        Key: destKey,
+        CopySource: `${bucket}/${sourceKey}`,
+      })
+    );
+
+    expect(copyResult.$metadata.httpStatusCode).toBe(200);
+    expect(copyResult.CopyObjectResult?.ETag).toBeTruthy();
+    expect(copyResult.CopyObjectResult?.LastModified).toBeTruthy();
+
+    // Verify destination object exists with correct content
+    const getResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: destKey })
+    );
+    const destContent = await getResult.Body?.transformToString();
+    expect(destContent).toBe(content);
+
+    // Verify source object still exists
+    const sourceResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: sourceKey })
+    );
+    const sourceContent = await sourceResult.Body?.transformToString();
+    expect(sourceContent).toBe(content);
+  });
+
+  it("can copy a large chunked object", async () => {
+    const doName = "copy-large-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+    const sourceKey = "large-source.bin";
+    const destKey = "large-dest.bin";
+
+    // Create a file larger than CHUNK_SIZE (1MB)
+    const size = 2 * 1024 * 1024; // 2MB
+    const largeData = new Uint8Array(size);
+    for (let i = 0; i < size; i++) {
+      largeData[i] = i % 256;
+    }
+
+    // Create source object
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: sourceKey, Body: largeData })
+    );
+
+    // Copy object
+    const copyResult = await s3Client.send(
+      new CopyObjectCommand({
+        Bucket: bucket,
+        Key: destKey,
+        CopySource: `${bucket}/${sourceKey}`,
+      })
+    );
+
+    expect(copyResult.$metadata.httpStatusCode).toBe(200);
+
+    // Verify destination object has correct size and content
+    const getResult = await s3Client.send(
+      new GetObjectCommand({ Bucket: bucket, Key: destKey })
+    );
+    expect(getResult.ContentLength).toBe(size);
+
+    const destData = await getResult.Body?.transformToByteArray();
+    expect(destData?.length).toBe(size);
+    expect(destData?.[0]).toBe(0);
+    expect(destData?.[size - 1]).toBe((size - 1) % 256);
+  });
+
+  it("returns error when copying non-existent source", async () => {
+    const doName = "copy-error-test";
+    const s3Client = await createS3ClientForBucket(doName);
+    const bucket = doName;
+
+    await expect(
+      s3Client.send(
+        new CopyObjectCommand({
+          Bucket: bucket,
+          Key: "dest.txt",
+          CopySource: `${bucket}/non-existent.txt`,
+        })
+      )
+    ).rejects.toThrow();
   });
 });

@@ -16,7 +16,7 @@
       "class_name": "AppContainer",
       "image": "./Dockerfile",
       "max_instances": 10,
-      "instance_type": "standard-1",
+      "instance_type": "standard-3",
       "rollout_active_grace_period": 0,
       "rollout_step_percentage": [100],
     },

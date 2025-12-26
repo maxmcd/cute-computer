@@ -26,6 +26,7 @@ import (
 const (
 	pongWait   = 60 * time.Second
 	pingPeriod = (pongWait * 9) / 10
+	dataDir    = "/data"
 )
 
 var upgrader = websocket.Upgrader{
@@ -53,7 +54,7 @@ type resizeMessage struct {
 
 // FileInfo represents file metadata for API responses
 type FileInfo struct {
-	Path  string `json:"path"`  // Relative to /home/cutie
+	Path  string `json:"path"`  // Relative to base directory
 	Name  string `json:"name"`  // Basename of file
 	IsDir bool   `json:"isDir"` // True if directory
 	Size  int64  `json:"size"`  // File size in bytes
@@ -61,8 +62,8 @@ type FileInfo struct {
 
 // MoveRequest represents a file move/rename operation
 type MoveRequest struct {
-	From string `json:"from"` // Source path (relative to /home/cutie)
-	To   string `json:"to"`   // Destination path (relative to /home/cutie)
+	From string `json:"from"` // Source path (relative to base directory)
+	To   string `json:"to"`   // Destination path (relative to base directory)
 }
 
 // Config represents the user's configuration file
@@ -105,7 +106,7 @@ func waitForMount(path string, timeout time.Duration) error {
 }
 
 // validateAndResolvePath validates a relative path and converts it to absolute
-// Returns absolute path within /home/cutie or error if invalid
+// Returns absolute path within dataDir or error if invalid
 func validateAndResolvePath(relativePath string) (string, error) {
 	// Clean the path to remove .. and .
 	cleanPath := filepath.Clean(relativePath)
@@ -114,23 +115,23 @@ func validateAndResolvePath(relativePath string) (string, error) {
 	cleanPath = strings.TrimPrefix(cleanPath, "/")
 
 	// Build absolute path
-	absPath := filepath.Join("/home/cutie", cleanPath)
+	absPath := filepath.Join(dataDir, cleanPath)
 
-	// Security check: ensure path is within /home/cutie
-	if !strings.HasPrefix(absPath, "/home/cutie/") && absPath != "/home/cutie" {
-		return "", fmt.Errorf("invalid path: must be within /home/cutie")
+	// Security check: ensure path is within dataDir
+	if !strings.HasPrefix(absPath, dataDir+string(filepath.Separator)) && absPath != dataDir {
+		return "", fmt.Errorf("invalid path: must be within %q", dataDir)
 	}
 
 	return absPath, nil
 }
 
-// toRelativePath converts absolute path to relative (strips /home/cutie prefix)
+// toRelativePath converts absolute path to relative (strips dataDir prefix)
 func toRelativePath(absPath string) string {
-	// Remove /home/cutie/ prefix
-	rel := strings.TrimPrefix(absPath, "/home/cutie/")
-	// Also handle exact match for /home/cutie (root)
+	// Remove dataDir/ prefix
+	rel := strings.TrimPrefix(absPath, dataDir+string(filepath.Separator))
+	// Also handle exact match for dataDir (root)
 	if rel == absPath {
-		rel = strings.TrimPrefix(absPath, "/home/cutie")
+		rel = strings.TrimPrefix(absPath, dataDir)
 	}
 	// Remove leading slash
 	rel = strings.TrimPrefix(rel, "/")
@@ -144,7 +145,7 @@ func writeLog(logMessage string) {
 	logsToken := os.Getenv("LOGS_TOKEN")
 
 	// Replace entire host with host.docker.internal if URL contains localhost
-	if strings.Contains(logsEndpoint, "localhost") {
+	if strings.Contains(logsEndpoint, "localhost") || strings.Contains(logsEndpoint, "127.0.0.1") {
 		if parsedURL, err := url.Parse(logsEndpoint); err == nil {
 			parsedURL.Host = strings.Replace(parsedURL.Host, parsedURL.Hostname(), "host.docker.internal", 1)
 			logsEndpoint = parsedURL.String()
@@ -198,15 +199,15 @@ func writeLog(logMessage string) {
 func ensureConfigExists() error {
 	// Check for both .json and .jsonc
 	configPath := ""
-	if _, err := os.Stat("/home/cutie/config.json"); err == nil {
+	if _, err := os.Stat(fmt.Sprintf("%s/config.json", dataDir)); err == nil {
 		return nil // config.json exists
 	}
-	if _, err := os.Stat("/home/cutie/config.jsonc"); err == nil {
+	if _, err := os.Stat(fmt.Sprintf("%s/config.jsonc", dataDir)); err == nil {
 		return nil // config.jsonc exists
 	}
 
 	// Neither exists, create default config.json
-	configPath = "/home/cutie/config.json"
+	configPath = fmt.Sprintf("%s/config.json", dataDir)
 	defaultConfig := `{
   "static": "."
 }`
@@ -223,10 +224,10 @@ func ensureConfigExists() error {
 func loadConfig() (*Config, error) {
 	// Find which config file exists
 	configPath := ""
-	if _, err := os.Stat("/home/cutie/config.json"); err == nil {
-		configPath = "/home/cutie/config.json"
-	} else if _, err := os.Stat("/home/cutie/config.jsonc"); err == nil {
-		configPath = "/home/cutie/config.jsonc"
+	if _, err := os.Stat(fmt.Sprintf("%s/config.json", dataDir)); err == nil {
+		configPath = fmt.Sprintf("%s/config.json", dataDir)
+	} else if _, err := os.Stat(fmt.Sprintf("%s/config.jsonc", dataDir)); err == nil {
+		configPath = fmt.Sprintf("%s/config.jsonc", dataDir)
 	} else {
 		return nil, fmt.Errorf("no config file found (tried config.json and config.jsonc)")
 	}
@@ -278,20 +279,20 @@ func loadConfig() (*Config, error) {
 
 // resolveStaticPath resolves the static directory path securely
 func resolveStaticPath(staticPath string) (string, error) {
-	// Resolve relative to /home/cutie
+	// Resolve relative to dataDir
 	var fullPath string
 	if filepath.IsAbs(staticPath) {
 		fullPath = staticPath
 	} else {
-		fullPath = filepath.Join("/home/cutie", staticPath)
+		fullPath = filepath.Join(dataDir, staticPath)
 	}
 
 	// Clean the path to remove .. and .
 	fullPath = filepath.Clean(fullPath)
 
-	// Security: ensure path is within /home/cutie
-	if !strings.HasPrefix(fullPath, "/home/cutie/") && fullPath != "/home/cutie" {
-		return "", fmt.Errorf("static path must be within /home/cutie (got: %s)", fullPath)
+	// Security: ensure path is within dataDir
+	if !strings.HasPrefix(fullPath, dataDir+string(filepath.Separator)) && fullPath != dataDir {
+		return "", fmt.Errorf("static path must be within %q (got: %s)", dataDir, fullPath)
 	}
 
 	// Check if directory exists
@@ -336,9 +337,8 @@ func (s *ptySession) close() {
 	}
 }
 
-// serveErrorPage serves a beautiful error page
-func serveErrorPage(w http.ResponseWriter, title, message, details string) {
-	w.WriteHeader(http.StatusInternalServerError)
+func serveErrorPage(w http.ResponseWriter, statusCode int, title, message, details string) {
+	w.WriteHeader(statusCode)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
@@ -405,72 +405,10 @@ func serveErrorPage(w http.ResponseWriter, title, message, details string) {
 	w.Write([]byte(html))
 }
 
-// serve404 serves a 404 error page
 func serve404(w http.ResponseWriter, path string) {
-	w.WriteHeader(http.StatusNotFound)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>404 Not Found - Cute Computer</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: linear-gradient(135deg, #ffeef8 0%%, #e0d4f7 100%%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            max-width: 600px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
-            text-align: center;
-        }
-        h1 {
-            color: #d946ef;
-            font-size: 72px;
-            margin-bottom: 20px;
-        }
-        h2 {
-            color: #6b7280;
-            font-size: 24px;
-            margin-bottom: 20px;
-        }
-        .path {
-            background: #f3f4f6;
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-family: monospace;
-            color: #374151;
-            margin: 20px 0;
-            word-break: break-all;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>404</h1>
-        <h2>File Not Found</h2>
-        <div class="path">%s</div>
-        <p style="color: #6b7280; margin-top: 20px;">The file you're looking for doesn't exist.</p>
-    </div>
-</body>
-</html>`, path)
-
-	w.Write([]byte(html))
+	details := fmt.Sprintf(`<div class="details">%s</div>`, path)
+	serveErrorPage(w, http.StatusNotFound, "404 - File Not Found",
+		"The file you're looking for doesn't exist.", details)
 }
 
 // handleAPIFilesList lists files in a directory
@@ -770,7 +708,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	config, err := loadConfig()
 	if err != nil {
 		details := fmt.Sprintf(`<div class="details">%s</div>`, err.Error())
-		serveErrorPage(rw, "Configuration Error",
+		serveErrorPage(rw, http.StatusInternalServerError, "Configuration Error",
 			"There was a problem loading your config file. Please check the syntax and try again.",
 			details)
 		return
@@ -782,7 +720,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		details := fmt.Sprintf(`<div class="details">%s
 
 Configured path: %s</div>`, err.Error(), config.Static)
-		serveErrorPage(rw, "Static Directory Error",
+		serveErrorPage(rw, http.StatusInternalServerError, "Static Directory Error",
 			"The configured static directory could not be found or accessed.",
 			details)
 		return
@@ -902,16 +840,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	// Start in cutie's home directory
-	cmd.Dir = "/home/cutie"
+	cmd.Dir = dataDir
 
 	cmd.Env = []string{
 		"HOME=/home/cutie",
 		"USER=cutie",
 		"TERM=xterm-256color",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/cutie/.bun/bin",
 		"COLORTERM=truecolor",
 		fmt.Sprintf("PS1=%s", ps1),
-		"ENV=", // Disable any ENV file loading
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
 
 	// Start PTY
@@ -1070,21 +1007,21 @@ func main() {
 		}
 
 		// Create mount point directory
-		if err := os.MkdirAll("/home/cutie", 0755); err != nil {
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
 			log.Fatalf("Failed to create directory: %v", err)
 		}
 
 		bucket := fmt.Sprintf("s3-%s", doID)
 
-		// os.Stat("/home/cutie")
-
 		go func() {
 			// Use Durable Object ID as the S3 bucket name for per-computer isolation
 			cmd := exec.Command("/usr/local/bin/tigrisfs",
 				"--endpoint", "https://cute.maxmcd.com/",
+				"--debug_s3",
+				"--debug",
 				"-f",
 				bucket,
-				"/home/cutie")
+				dataDir)
 			// Pass JWT token as AWS access key ID
 			// tigrisfs will include this in the Authorization header's Credential field
 			// Format: "AWS4-HMAC-SHA256 Credential=<jwt>/20231201/auto/s3/aws4_request, ..."
@@ -1103,8 +1040,8 @@ func main() {
 		}()
 
 		// Wait for FUSE mount to be ready before proceeding
-		log.Printf("Waiting for FUSE mount at /home/cutie...")
-		if err := waitForMount("/home/cutie", 10*time.Second); err != nil {
+		log.Printf("Waiting for FUSE mount at %s...")
+		if err := waitForMount(dataDir, 10*time.Second); err != nil {
 			log.Fatalf("Failed to wait for mount: %v", err)
 		}
 	}

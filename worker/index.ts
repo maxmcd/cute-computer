@@ -50,7 +50,7 @@ export class AppContainer extends Container<Env> {
   // Port the container listens on (default: 8283)
   defaultPort = 8283;
   // Time before container sleeps due to inactivity (default: 30s)
-  sleepAfter = "10m";
+  sleepAfter = "2m";
   // Environment variables passed to the container
   envVars = {
     S3_AUTH_TOKEN: "",
@@ -167,18 +167,22 @@ class Worker {
   }
 
   private isValidSubdomain(hostname: string, subdomain: string): boolean {
-    // Exclude special hostnames that shouldn't use subdomain routing
+    // Exclude exact hostnames that shouldn't use subdomain routing
     const excludedHosts = [
-      "workers.dev",
       "cute.maxmcd.com",
       "host.lima.internal",
       "host.docker.internal",
     ];
 
-    for (const excluded of excludedHosts) {
-      if (hostname.includes(excluded)) {
-        return false;
-      }
+    // Check for exact match
+    if (excludedHosts.includes(hostname)) {
+      return false;
+    }
+
+    // Exclude workers.dev main domain but allow subdomains
+    if (hostname.endsWith(".workers.dev") && hostname.split(".").length === 3) {
+      // This is <worker-name>.workers.dev, not <subdomain>.<worker-name>.workers.dev
+      return false;
     }
 
     return subdomain !== "";
@@ -257,7 +261,11 @@ class Worker {
       return new Response("Invalid S3 path", { status: 400 });
     }
     const bucket = pathMatch[1].slice(4);
-    return this.env.S3.getByName(bucket).fetch(request);
+    const t0 = performance.now();
+    const resp = await this.env.S3.getByName(bucket).fetch(request);
+    const t1 = performance.now();
+    console.log(`S3 request took ${t1 - t0}ms`);
+    return resp;
   }
 
   private async handleLogsRequest(request: Request): Promise<Response> {

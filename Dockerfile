@@ -1,10 +1,6 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.25-trixie AS builder
 
-RUN apt-get update \
-    && apt-get install -y unzip \
-    && curl -fsSL https://bun.com/install | bash
-
 WORKDIR /opt
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -14,8 +10,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     cd ./container_src && go build -o /server .
 
 FROM debian:trixie
-RUN apt-get update && apt-get install -y curl unzip media-types ca-certificates fuse \
+
+RUN apt-get update && apt-get install -y \
+    media-types ca-certificates \
+    procps git iproute2 \
+    curl golang python3 unzip fuse \
 	&& rm -rf /var/lib/apt/lists/*
+
+RUN curl -k https://pub-48152f01335a43c8b9dbd7f7f459b363.r2.dev/Cloudflare_custom_CA.crt \
+    -o /usr/local/share/ca-certificates/Cloudflare_Corp_Zero_Trust_Cert.crt && \
+	update-ca-certificates
 
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
@@ -28,12 +32,18 @@ RUN ARCH=$(uname -m) && \
 
 # Create cutie user with home directory 
 RUN useradd -m -s /bin/bash cutie
+USER cutie
+RUN curl -fsSL https://bun.sh/install | bash \
+    && export PATH=/home/cutie/.bun/bin:$PATH \
+    && bun install -g opencode-ai \
+    && which bun \
+    && which opencode
 
 COPY --from=builder /server /server
-WORKDIR /opt
+WORKDIR /data
 
 EXPOSE 8283
 
-USER cutie
-# Run server as root, but shell sessions will run as cutie
+
+
 CMD ["/server"]

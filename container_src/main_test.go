@@ -427,7 +427,7 @@ func resolveStaticPathFromBase(baseDir, staticPath string) (string, error) {
 
 	// Security: ensure path is within baseDir
 	if !strings.HasPrefix(fullPath, baseDir+string(filepath.Separator)) && fullPath != baseDir {
-		return "", fmt.Errorf("static path must be within /home/cutie (got: %s)", fullPath)
+		return "", fmt.Errorf("static path must be within %q (got: %q)", baseDir, fullPath)
 	}
 
 	// Check if directory exists

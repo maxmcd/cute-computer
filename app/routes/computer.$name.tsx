@@ -568,9 +568,9 @@ export default function Computer() {
         </div>
 
         {/* Content Container */}
-        <div className="flex-1 flex flex-col items-center justify-center px-10 gap-8 pb-10">
+        <div className="flex-1 flex flex-col items-center justify-center px-4 md:px-10 gap-8 pb-10">
           {/* Computer Info Panel */}
-          <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl p-8 font-mono">
+          <div className="w-full md:max-w-2xl bg-white rounded-2xl shadow-2xl p-8 font-mono">
             <div>
               <div className="space-y-2 text-sm pb-1 text-gray-500">
                 computer
@@ -605,7 +605,7 @@ export default function Computer() {
           </div>
 
           {/* View Icons */}
-          <div className="grid grid-cols-4 gap-4 w-full max-w-2xl">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 w-full md:max-w-2xl">
             <button
               onClick={() => navigate(`/computer/${computerName}/terminal`)}
               className="flex flex-col items-center gap-2 p-6 rounded-xl hover:bg-purple-50 transition-colors group cursor-pointer"
@@ -613,7 +613,7 @@ export default function Computer() {
               <img
                 src="/terminal.png"
                 alt="Terminal"
-                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                className="w-20 h-20 md:w-16 md:h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
                 style={{
                   filter:
                     "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
@@ -631,7 +631,7 @@ export default function Computer() {
               <img
                 src="/editor.png"
                 alt="Editor"
-                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                className="w-20 h-20 md:w-16 md:h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
                 style={{
                   filter:
                     "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
@@ -649,7 +649,7 @@ export default function Computer() {
               <img
                 src="/logs.png"
                 alt="Logs"
-                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                className="w-20 h-20 md:w-16 md:h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
                 style={{
                   filter:
                     "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
@@ -667,7 +667,7 @@ export default function Computer() {
               <img
                 src="/preview.png"
                 alt="Preview"
-                className="w-16 h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
+                className="w-20 h-20 md:w-16 md:h-16 object-contain opacity-70 group-hover:opacity-100 transition-all duration-200"
                 style={{
                   filter:
                     "sepia(100%) saturate(300%) hue-rotate(280deg) brightness(0.9)",
