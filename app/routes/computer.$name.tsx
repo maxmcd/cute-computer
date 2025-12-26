@@ -716,7 +716,7 @@ export default function Computer() {
         >
           <div
             ref={containerRef}
-            className="h-[600px] p-4 bg-white relative overflow-hidden"
+            className="terminal-container flex-1 min-h-0 bg-white relative overflow-hidden"
             style={{ caretColor: "transparent" }}
           ></div>
         </Window>
@@ -737,7 +737,7 @@ export default function Computer() {
             </div>
           }
         >
-          <div className="flex h-[600px]">
+          <div className="flex flex-1 min-h-0">
             {/* File Tree - Left Panel */}
             <div className="w-[30%] border-r border-gray-300 overflow-auto">
               {loadingFiles ? (
@@ -833,7 +833,7 @@ export default function Computer() {
           {subdomainUrl && (
             <iframe
               src={subdomainUrl}
-              className="w-full h-[600px] border-0"
+              className="w-full flex-1 min-h-0 border-0"
               title="Preview"
             />
           )}
@@ -932,9 +932,9 @@ function LogsView({
 
   return (
     <Window title="Logs" onClose={onClose}>
-      <div className="h-[600px] flex flex-col bg-white">
+      <div className="flex-1 min-h-0 flex flex-col bg-white">
         {/* Search Bar */}
-        <div className="border-b border-gray-300 p-3">
+        <div className="border-b border-gray-300 p-3 flex-shrink-0">
           <div className="flex gap-2">
             <input
               type="text"

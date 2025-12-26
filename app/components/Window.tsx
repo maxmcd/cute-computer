@@ -14,9 +14,9 @@ export function Window({
   rightContent,
 }: WindowProps) {
   return (
-    <div className="bg-white rounded-xl shadow-2xl overflow-hidden">
+    <div className="bg-white rounded-xl shadow-2xl overflow-hidden flex-1 flex flex-col min-h-0">
       {/* Title Bar */}
-      <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400">
+      <div className="bg-gradient-to-r from-pink-300 to-purple-300 px-4 py-3 flex items-center gap-3 border-b border-purple-400 flex-shrink-0">
         {/* Traffic Lights */}
         {onClose && (
           <div className="flex gap-2 cursor-pointer">
@@ -41,7 +41,9 @@ export function Window({
       </div>
 
       {/* Window Content */}
-      {children}
+      <div className="flex-1 min-h-0 flex flex-col">
+        {children}
+      </div>
     </div>
   );
 }

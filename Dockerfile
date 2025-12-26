@@ -14,6 +14,7 @@ FROM debian:trixie
 RUN apt-get update && apt-get install -y \
     media-types ca-certificates \
     procps git iproute2 \
+    strace \
     curl golang python3 unzip fuse \
 	&& rm -rf /var/lib/apt/lists/*
 
